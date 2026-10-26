@@ -1,0 +1,448 @@
+[
+ {
+  "path": "/git/list",
+  "request": {
+   "0": "public/demo.git",
+   "for_push": false
+  }
+ },
+ {
+  "path": "/git/fetch",
+  "request": {
+   "0": "public/demo.git",
+   "refs": [
+    {
+     "ref": "refs/heads/main",
+     "sha": "022bb198eeb34fd26039493ee5eee567298808cd"
+    }
+   ]
+  }
+ },
+ {
+  "path": "/git/list",
+  "request": {
+   "0": "public/demo.git",
+   "for_push": true
+  }
+ },
+ {
+  "path": "/git/push",
+  "request": {
+   "0": "public/demo.git",
+   "bundle": "<bytes>",
+   "force": false,
+   "local_ref": "HEAD",
+   "remote_ref": "refs/heads/main"
+  }
+ },
+ {
+  "path": "/git/push",
+  "request": {
+   "0": "public/demo.git",
+   "bundle": "<bytes>",
+   "force": false,
+   "local_ref": "refs/heads/main",
+   "remote_ref": "refs/heads/main"
+  }
+ },
+ {
+  "path": "/git/list",
+  "request": {
+   "0": "public/nope.git",
+   "for_push": false
+  }
+ },
+ {
+  "path": "/git/fetch",
+  "request": {
+   "0": "public/demo.git",
+   "refs": []
+  }
+ },
+ {
+  "path": "/git/list",
+  "request": {
+   "0": "public/new1.git",
+   "for_push": false
+  }
+ },
+ {
+  "path": "/git/list",
+  "request": {
+   "0": "public/new1.git",
+   "for_push": true
+  }
+ },
+ {
+  "path": "/git/fork",
+  "request": {
+   "0": "public/forky.git",
+   "source": "rns://727ca184e3d7e83e0e35146940920442/public/demo.git"
+  }
+ },
+ {
+  "path": "/git/mirror",
+  "request": {
+   "0": "public/mirry.git",
+   "source": "rns://727ca184e3d7e83e0e35146940920442/public/demo.git"
+  }
+ },
+ {
+  "path": "/mgmt/perms",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "rperms",
+   "step": "get"
+  }
+ },
+ {
+  "path": "/mgmt/perms",
+  "request": {
+   "0": "public/demo.git",
+   "content": "r:all\n",
+   "operation": "rperms",
+   "step": "set"
+  }
+ },
+ {
+  "path": "/git/fork",
+  "request": {
+   "0": "public/forky2.git",
+   "source": "rns://727ca184e3d7e83e0e35146940920442/public/demo.git"
+  }
+ },
+ {
+  "path": "/git/fetch",
+  "request": {
+   "0": "public/demo.git",
+   "refs": [
+    {
+     "ref": "refs/heads/main",
+     "sha": "f8e8558727a95429ad4c65a02ed661ea84d15b78"
+    }
+   ]
+  }
+ },
+ {
+  "path": "/git/mirror",
+  "request": {
+   "0": "public/mirry2.git",
+   "source": "rns://727ca184e3d7e83e0e35146940920442/public/demo.git"
+  }
+ },
+ {
+  "path": "/mgmt/perms",
+  "request": {
+   "2": "public",
+   "operation": "gperms",
+   "step": "get"
+  }
+ },
+ {
+  "path": "/mgmt/perms",
+  "request": {
+   "2": "public",
+   "content": "r:all\n",
+   "operation": "gperms",
+   "step": "set"
+  }
+ },
+ {
+  "path": "/git/push",
+  "request": {
+   "0": "public/demo.git",
+   "operations": [
+    {
+     "action": "update_ref",
+     "force": false,
+     "ref": "refs/tags/v1.0.0",
+     "sha": "f8e8558727a95429ad4c65a02ed661ea84d15b78"
+    }
+   ]
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "list"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "hash": null,
+   "notes": "First release notes",
+   "notes_format": "markdown",
+   "operation": "create",
+   "step": "init",
+   "tag": "1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "view",
+   "tag": "1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact": "manifest.rsm",
+   "operation": "fetch",
+   "tag": "latest"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "hash": "f8e8558727a95429ad4c65a02ed661ea84d15b78",
+   "notes": "First release notes",
+   "notes_format": "markdown",
+   "operation": "create",
+   "step": "init",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact_data": "<bytes>",
+   "artifact_name": "manifest.rsm",
+   "operation": "create",
+   "step": "artifact",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact_data": "<bytes>",
+   "artifact_name": "b.bin.rsg",
+   "operation": "create",
+   "step": "artifact",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact_data": "<bytes>",
+   "artifact_name": "b.bin",
+   "operation": "create",
+   "step": "artifact",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact_data": "<bytes>",
+   "artifact_name": "a.txt.rsg",
+   "operation": "create",
+   "step": "artifact",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact_data": "<bytes>",
+   "artifact_name": "a.txt",
+   "operation": "create",
+   "step": "artifact",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "create",
+   "step": "finalize",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "view",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact": "b.bin",
+   "operation": "fetch",
+   "tag": "latest"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "artifact": "a.txt",
+   "operation": "fetch",
+   "tag": "latest"
+  }
+ },
+ {
+  "path": "/mgmt/release",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "delete",
+   "tag": "v1.0.0"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "list",
+   "scope": "active"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "content": "Body of doc one",
+   "format": "markdown",
+   "operation": "create",
+   "signature": "<bytes>",
+   "title": "Doc one"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "content": "Proposal body",
+   "format": "markdown",
+   "operation": "propose",
+   "signature": "<bytes>",
+   "title": "Prop one"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "list",
+   "scope": "all"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 1,
+   "operation": "view",
+   "scope": "active"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "content": "A comment",
+   "doc_id": 1,
+   "format": "markdown",
+   "operation": "comment",
+   "scope": "active"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "content": "Edited body",
+   "doc_id": 1,
+   "operation": "edit",
+   "scope": "active",
+   "signature": "<bytes>",
+   "title": "Doc one"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 1,
+   "operation": "complete"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 1,
+   "operation": "activate"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 1,
+   "operation": "perms",
+   "step": "get"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "content": "r:all\n",
+   "doc_id": 1,
+   "operation": "perms",
+   "step": "set"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 1,
+   "operation": "delete",
+   "scope": "active"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "doc_id": 2,
+   "operation": "view",
+   "scope": "proposed"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "list",
+   "scope": "bogus"
+  }
+ },
+ {
+  "path": "/mgmt/work",
+  "request": {
+   "0": "public/demo.git",
+   "operation": "list"
+  }
+ }
+]

@@ -1,0 +1,47 @@
+[package]
+name = "rngit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Client library for rngit, the Git-over-Reticulum protocol"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/zevaryx/rngit-rs"
+
+[features]
+default = ["reticulum"]
+# Transport over a live Reticulum link (rsReticulum). Turn it off to use the
+# protocol layer with your own `Transport`.
+reticulum = ["dep:rns-runtime", "dep:rns-identity", "dep:tokio"]
+
+[[bin]]
+name = "git-remote-rns"
+path = "src/bin/git-remote-rns.rs"
+required-features = ["reticulum"]
+
+[[bin]]
+name = "rngit"
+path = "src/bin/rngit.rs"
+required-features = ["reticulum"]
+
+[dependencies]
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
+gix-odb = { version = "0.87.0", default-features = false }
+gix-pack = { version = "0.77.0", default-features = false, features = ["generate", "streaming-input"] }
+rmpv = "1"
+thiserror = "2"
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+rns-runtime = { git = "https://github.com/zevaryx/rsReticulum", rev = "6fb0dee95622c49c517b7e8a6f42e4a01b0eb3cf", optional = true }
+rns-identity = { git = "https://github.com/zevaryx/rsReticulum", rev = "6fb0dee95622c49c517b7e8a6f42e4a01b0eb3cf", optional = true }
+tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+ed25519-dalek = "2"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+
+[[example]]
+name = "live"
+required-features = ["reticulum"]

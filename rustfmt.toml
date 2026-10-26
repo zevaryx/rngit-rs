@@ -1,0 +1,6 @@
+# Lines up to 140 columns, and calls, struct literals, chains and short
+# `if`/`let … else` blocks kept on one line while they fit, rather than
+# rustfmt's narrower defaults.
+edition = "2024"
+max_width = 140
+use_small_heuristics = "Max"
