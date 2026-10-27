@@ -517,3 +517,141 @@ async fn a_failed_mirror_leaves_an_existing_copy_as_it_was() {
     assert_eq!(remote_sha(&dest, "main"), before);
     git(&dest, &["fsck", "--strict"]);
 }
+
+/// A bare copy of `work`, the way a mirror is kept: branches and tags only.
+fn copy_of(work: &std::path::Path, dest: &std::path::Path) {
+    bare_repo(dest);
+    git(work, &["push", "-q", dest.to_str().unwrap(), "main", "--tags"]);
+}
+
+#[tokio::test]
+async fn push_all_sends_every_branch_and_tag_then_finds_nothing_to_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, copy) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 3);
+    git(&work, &["branch", "side"]);
+    git(&work, &["tag", "v1"]);
+    git(&work, &["tag", "-a", "-m", "release", "v2"]);
+    bare_repo(&copy);
+    git(&work, &["push", "-q", copy.to_str().unwrap(), "main", "side", "--tags"]);
+    bare_repo(&server);
+    let client = Client::new(MockNode::new(server.clone()));
+
+    let report = client.push_all(&url(), &copy, false, false).await.unwrap();
+    let mut pushed = report.pushed.clone();
+    pushed.sort();
+    assert_eq!(pushed, ["refs/heads/main", "refs/heads/side", "refs/tags/v1", "refs/tags/v2"]);
+    assert!(report.up_to_date.is_empty() && report.rejected.is_empty() && report.deleted.is_empty());
+    git(&server, &["fsck", "--strict"]);
+    for name in ["refs/heads/main", "refs/heads/side", "refs/tags/v1", "refs/tags/v2"] {
+        assert_eq!(remote_sha(&server, name), remote_sha(&copy, name), "{name}");
+    }
+    // The annotated tag keeps its tag object.
+    assert_eq!(git(&server, &["cat-file", "-t", "refs/tags/v2"]), "tag");
+
+    let again = client.push_all(&url(), &copy, false, false).await.unwrap();
+    assert!(again.pushed.is_empty() && again.up_to_date.len() == 4, "{again:?}");
+    let sent = client.transport().requests().iter().filter(|(path, _)| path == "/git/push").count();
+    assert_eq!(sent, 4, "the second run sends nothing");
+}
+
+#[tokio::test]
+async fn push_all_sends_only_what_is_new_on_an_existing_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, copy) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "more"]);
+    git(&work, &["tag", "v1"]);
+    copy_of(&work, &copy);
+    let client = Client::new(MockNode::new(server.clone()));
+
+    let report = client.push_all(&url(), &copy, false, false).await.unwrap();
+    assert_eq!(report.pushed.len(), 2, "{report:?}");
+    assert_eq!(remote_sha(&server, "main"), remote_sha(&copy, "main"));
+    git(&server, &["fsck", "--strict"]);
+}
+
+#[tokio::test]
+async fn push_all_leaves_a_diverged_branch_unless_forced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, copy) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    // The node moves on; the copy has a different second commit.
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "node only"]);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    git(&work, &["reset", "-q", "--hard", "HEAD~2"]);
+    git(&work, &["commit", "-q", "--allow-empty", "-m", "copy only"]);
+    git(&work, &["tag", "v1"]);
+    copy_of(&work, &copy);
+    let node_main = remote_sha(&server, "main");
+    let client = Client::new(MockNode::new(server.clone()));
+
+    let report = client.push_all(&url(), &copy, false, false).await.unwrap();
+    assert_eq!(report.rejected, ["refs/heads/main"]);
+    assert_eq!(report.pushed, ["refs/tags/v1"]);
+    assert_eq!(remote_sha(&server, "main"), node_main, "the node's branch is untouched");
+
+    let report = client.push_all(&url(), &copy, true, false).await.unwrap();
+    assert!(report.rejected.is_empty() && report.pushed.contains(&"refs/heads/main".to_string()), "{report:?}");
+    assert_eq!(remote_sha(&server, "main"), remote_sha(&copy, "main"));
+}
+
+#[tokio::test]
+async fn push_all_deletes_extra_refs_only_when_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, copy) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    git(&work, &["branch", "old"]);
+    git(&work, &["tag", "old-tag"]);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main", "old", "old-tag"]);
+    copy_of(&work, &copy);
+    git(&work, &["push", "-q", copy.to_str().unwrap(), "old"]);
+    git(&copy, &["branch", "-D", "old"]);
+    git(&copy, &["tag", "-d", "old-tag"]);
+    let client = Client::new(MockNode::new(server.clone()));
+
+    let report = client.push_all(&url(), &copy, false, false).await.unwrap();
+    assert!(report.deleted.is_empty());
+    assert!(gix::open(&server).unwrap().find_reference("refs/heads/old").is_ok());
+
+    let report = client.push_all(&url(), &copy, false, true).await.unwrap();
+    let mut deleted = report.deleted.clone();
+    deleted.sort();
+    assert_eq!(deleted, ["refs/heads/old", "refs/tags/old-tag"]);
+    let node = gix::open(&server).unwrap();
+    assert!(node.find_reference("refs/heads/old").is_err() && node.find_reference("refs/tags/old-tag").is_err());
+    assert!(node.find_reference("refs/heads/main").is_ok());
+}
+
+#[tokio::test]
+async fn push_all_without_permission_or_a_repository_fails_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server) = (tmp.path().join("work"), tmp.path().join("server.git"));
+    work_repo(&work, 1);
+    bare_repo(&server);
+    let mut node = MockNode::new(server);
+    node.allow_write = false;
+    let client = Client::new(node);
+    assert!(matches!(client.push_all(&url(), &work, false, false).await, Err(Error::Remote { status: Status::NotAllowed, .. })));
+    // A folder that isn't a repository is an error, not a panic.
+    let nothing = tmp.path().join("nothing");
+    std::fs::create_dir_all(&nothing).unwrap();
+    let node = MockNode::new(tmp.path().join("server.git"));
+    let client = Client::new(node);
+    assert!(client.push_all(&url(), &nothing, false, false).await.is_err());
+}
+
+#[tokio::test]
+async fn push_all_of_an_empty_repository_sends_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (empty, server) = (tmp.path().join("empty.git"), tmp.path().join("server.git"));
+    bare_repo(&empty);
+    bare_repo(&server);
+    let client = Client::new(MockNode::new(server));
+    assert_eq!(client.push_all(&url(), &empty, false, false).await.unwrap(), rngit::PushReport::default());
+}

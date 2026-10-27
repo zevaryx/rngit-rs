@@ -20,7 +20,7 @@ pub mod transport;
 pub mod url;
 pub mod wire;
 
-pub use client::{Client, Limits, RemoteRefs, Want};
+pub use client::{Client, Limits, PushReport, RemoteRefs, Want};
 pub use error::{Error, Result, Status};
 pub use transport::{Response, Transport};
 pub use url::RepoUrl;

@@ -237,3 +237,25 @@ async fn bad_arguments_are_errors() {
     }
     assert_eq!(client.transport().requests().len(), before, "help never touches the network");
 }
+
+#[tokio::test]
+async fn push_all_reports_what_it_did() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server) = (tmp.path().join("work"), tmp.path().join("server.git"));
+    work_repo(&work, 2);
+    git(&work, &["tag", "v1"]);
+    bare_repo(&server);
+    let client = Client::new(canned(server.clone()));
+    let dir = work.to_str().unwrap();
+
+    let (result, text) = cli(&client, &["push-all", URL, dir], "").await;
+    result.unwrap();
+    assert_eq!(text, "pushed 2, up to date 0, rejected 0, deleted 0\n");
+    let (result, text) = cli(&client, &["push-all", URL, dir, "force", "prune"], "").await;
+    result.unwrap();
+    assert_eq!(text, "pushed 0, up to date 2, rejected 0, deleted 0\n");
+    let (result, _) = cli(&client, &["push-all", URL, dir, "everything"], "").await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+    let (result, _) = cli(&client, &["push-all", URL], "").await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+}

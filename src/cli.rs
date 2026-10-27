@@ -21,6 +21,7 @@ Repositories (URL is rns://<destination>/<group>/<repo>):
   create URL                    create an empty repository
   fork URL SOURCE               fork SOURCE (an rns, https or ssh URL) on the node
   mirror URL SOURCE             mirror SOURCE on the node
+  push-all URL DIR [force] [prune]   push every branch and tag of the repository in DIR
   delete-ref URL REF            delete a branch or tag on the node (REF is refs/heads/NAME or refs/tags/NAME)
   sync URL                      update a fork or mirror from its source
 Permissions (TEXT is the new file content, or - to read standard input):
@@ -127,6 +128,27 @@ pub async fn run<T: Transport>(
             }
             let refs = client.clone_into(&repo, &dir).await?;
             say(out, format!("cloned {} refs into {}", refs.refs.len(), dir.display()))?;
+        }
+        "push-all" => {
+            let dir = PathBuf::from(arg(1, "DIR")?);
+            let flag = |name: &str| rest[2..].iter().any(|a| a == name);
+            if let Some(other) = rest[2..].iter().find(|a| !matches!(a.as_str(), "force" | "prune")) {
+                return Err(Error::InvalidInput(format!("push-all: unknown option {other:?}")));
+            }
+            let report = client.push_all(&repo, &dir, flag("force"), flag("prune")).await?;
+            say(
+                out,
+                format!(
+                    "pushed {}, up to date {}, rejected {}, deleted {}",
+                    report.pushed.len(),
+                    report.up_to_date.len(),
+                    report.rejected.len(),
+                    report.deleted.len()
+                ),
+            )?;
+            for name in &report.rejected {
+                say(out, format!("rejected (not a fast-forward): {name}"))?;
+            }
         }
         "create" => client.create(&repo).await?,
         "fork" => client.fork(&repo, arg(1, "SOURCE")?).await?,

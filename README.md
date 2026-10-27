@@ -19,7 +19,7 @@ Requires Rust 1.89 or newer (edition 2024).
 
 | Area | Calls |
 |---|---|
-| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `mirror_into`, `push_from`, `push_from_with`, `push_bundle`, `delete_ref`, `update_ref` |
+| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `mirror_into`, `push_from`, `push_from_with`, `push_all`, `push_bundle`, `delete_ref`, `update_ref` |
 | Repositories | `create`, `fork`, `mirror`, `sync` |
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
 | Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release` |
@@ -27,7 +27,7 @@ Requires Rust 1.89 or newer (edition 2024).
 | Finding nodes | `discovery::discover` listens for rngit announces |
 
 Fetches only download what the local repository lacks. Pushes send a bundle, or just move the ref
-(`update_ref`) when the node already holds the object. Annotated tags keep their tag object.
+(`update_ref`) when the node already holds the object. Annotated tags keep their tag object. `push_all` (`rngit push-all URL DIR [force] [prune]`) sends every branch and tag of a local repository, such as a mirror, to another node; a branch that isn't a fast-forward is reported and left alone unless forced, and `prune` also deletes what the node has and the copy doesn't.
 
 `/git/delete` deletes a branch or tag (`delete_ref`). No request that deletes a whole repository
 was found, so the library has none. Details are in [`docs/protocol.md`](docs/protocol.md).
