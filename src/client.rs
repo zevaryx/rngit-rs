@@ -314,6 +314,16 @@ impl<T: Transport> Client<T> {
         Ok(remote)
     }
 
+    /// Make `dest` a copy of the repository: clone it, or bring an existing
+    /// copy up to date. A branch or tag the node no longer has is removed
+    /// from the copy too. Returns the node's refs and how many were removed.
+    pub async fn mirror_into(&self, repo: &RepoUrl, dest: &Path) -> Result<(RemoteRefs, usize)> {
+        let remote = self.clone_into(repo, dest).await?;
+        let repository = gix::open(dest).map_err(Error::git)?;
+        let removed = prune_refs(&repository, &remote)?;
+        Ok((remote, removed))
+    }
+
     /// Send a bundle for one ref. See [`Client::push_from`] for the usual route.
     pub async fn push_bundle(&self, repo: &RepoUrl, local_ref: &str, remote_ref: &str, force: bool, bundle: Vec<u8>) -> Result<()> {
         for name in [local_ref, remote_ref] {
@@ -742,6 +752,33 @@ fn perms_content(value: &Value) -> Result<String> {
 }
 
 /// Point a repository's HEAD at a branch, if the branch is a valid ref name.
+/// Remove the branches and tags of `repo` that `remote` doesn't list.
+/// Returns how many were removed.
+pub fn prune_refs(repo: &gix::Repository, remote: &RemoteRefs) -> Result<usize> {
+    let mut stale = Vec::new();
+    let platform = repo.references().map_err(Error::git)?;
+    for prefix in ["refs/heads/", "refs/tags/"] {
+        for reference in platform.prefixed(prefix).map_err(Error::git)?.flatten() {
+            let name = reference.name().as_bstr().to_string();
+            if remote.get(&name).is_none() {
+                stale.push(name);
+            }
+        }
+    }
+    for name in &stale {
+        let edit = gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Delete {
+                expected: gix::refs::transaction::PreviousValue::Any,
+                log: gix::refs::transaction::RefLog::AndReference,
+            },
+            name: name.as_str().try_into().map_err(Error::git)?,
+            deref: false,
+        };
+        repo.edit_reference(edit).map_err(Error::git)?;
+    }
+    Ok(stale.len())
+}
+
 fn set_head(repo: &gix::Repository, target: &str) -> Result<()> {
     if !target.starts_with("refs/heads/") {
         return Ok(());

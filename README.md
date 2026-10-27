@@ -19,7 +19,7 @@ Requires Rust 1.89 or newer (edition 2024).
 
 | Area | Calls |
 |---|---|
-| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `push_from`, `push_from_with`, `push_bundle`, `delete_ref`, `update_ref` |
+| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `mirror_into`, `push_from`, `push_from_with`, `push_bundle`, `delete_ref`, `update_ref` |
 | Repositories | `create`, `fork`, `mirror`, `sync` |
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
 | Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release` |

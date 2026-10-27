@@ -401,3 +401,119 @@ async fn an_older_commit_the_node_has_in_its_history_is_not_sent_again() {
     assert!(common::field(&sent[0].1, "bundle").is_some());
     git(&server, &["fsck", "--strict"]);
 }
+
+fn commit_file(work: &std::path::Path, name: &str) {
+    std::fs::write(work.join(name), format!("{name}\n")).unwrap();
+    git(work, &["add", "."]);
+    git(work, &["commit", "-q", "-m", name]);
+}
+
+#[tokio::test]
+async fn mirror_makes_a_copy_then_brings_it_up_to_date() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, dest) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 3);
+    git(&work, &["tag", "v1"]);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main", "v1"]);
+    let client = Client::new(MockNode::new(server.clone()));
+
+    let (remote, removed) = client.mirror_into(&url(), &dest).await.unwrap();
+    assert_eq!((remote.refs.len(), removed), (2, 0));
+    git(&dest, &["fsck", "--strict"]);
+    assert_eq!(remote_sha(&dest, "main"), remote_sha(&work, "main"));
+    assert_eq!(git(&dest, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+
+    // New work on the node: the second run takes only that.
+    commit_file(&work, "four.txt");
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    let (_, removed) = client.mirror_into(&url(), &dest).await.unwrap();
+    assert_eq!(removed, 0);
+    git(&dest, &["fsck", "--strict"]);
+    assert_eq!(git(&dest, &["rev-list", "--count", "main"]), "4");
+    assert_eq!(remote_sha(&dest, "main"), remote_sha(&work, "main"));
+    // Nothing new: the same again.
+    client.mirror_into(&url(), &dest).await.unwrap();
+    assert_eq!(remote_sha(&dest, "main"), remote_sha(&work, "main"));
+}
+
+#[tokio::test]
+async fn mirror_removes_what_the_node_no_longer_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, dest) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    git(&work, &["tag", "v1"]);
+    git(&work, &["checkout", "-q", "-b", "topic"]);
+    commit_file(&work, "topic.txt");
+    git(&work, &["checkout", "-q", "main"]);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main", "topic", "v1"]);
+    let client = Client::new(MockNode::new(server.clone()));
+    client.mirror_into(&url(), &dest).await.unwrap();
+    assert!(gix::open(&dest).unwrap().find_reference("refs/heads/topic").is_ok());
+
+    git(&server, &["branch", "-D", "topic"]);
+    git(&server, &["tag", "-d", "v1"]);
+    let (remote, removed) = client.mirror_into(&url(), &dest).await.unwrap();
+    assert_eq!((remote.refs.len(), removed), (1, 2));
+    let copy = gix::open(&dest).unwrap();
+    assert!(copy.find_reference("refs/heads/topic").is_err());
+    assert!(copy.find_reference("refs/tags/v1").is_err());
+    assert!(copy.find_reference("refs/heads/main").is_ok());
+}
+
+#[tokio::test]
+async fn mirror_follows_a_forced_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, dest) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 3);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    let client = Client::new(MockNode::new(server.clone()));
+    client.mirror_into(&url(), &dest).await.unwrap();
+
+    // The branch is rewound and given other work.
+    git(&work, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit_file(&work, "other.txt");
+    git(&work, &["push", "-q", "-f", server.to_str().unwrap(), "main"]);
+    client.mirror_into(&url(), &dest).await.unwrap();
+    git(&dest, &["fsck", "--strict"]);
+    assert_eq!(remote_sha(&dest, "main"), remote_sha(&work, "main"));
+    assert_eq!(git(&dest, &["rev-list", "--count", "main"]), "2");
+}
+
+#[tokio::test]
+async fn mirror_of_an_empty_repository_is_an_empty_copy_and_prunes_to_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, dest) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 1);
+    bare_repo(&server);
+    let client = Client::new(MockNode::new(server.clone()));
+    let (remote, removed) = client.mirror_into(&url(), &dest).await.unwrap();
+    assert!((remote.refs.is_empty(), removed) == (true, 0) && gix::open(&dest).is_ok());
+
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    client.mirror_into(&url(), &dest).await.unwrap();
+    git(&server, &["branch", "-D", "main"]);
+    let (_, removed) = client.mirror_into(&url(), &dest).await.unwrap();
+    assert_eq!(removed, 1);
+}
+
+#[tokio::test]
+async fn a_failed_mirror_leaves_an_existing_copy_as_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server, dest) = (tmp.path().join("work"), tmp.path().join("server.git"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    bare_repo(&server);
+    git(&work, &["push", "-q", server.to_str().unwrap(), "main"]);
+    Client::new(MockNode::new(server.clone())).mirror_into(&url(), &dest).await.unwrap();
+    let before = remote_sha(&dest, "main");
+
+    // A node that is gone.
+    let mut node = MockNode::new(server.clone());
+    node.extra = Box::new(|_, _| Some(status(0x01, "Not allowed")));
+    let gone = Client::new(node);
+    assert!(gone.mirror_into(&url(), &dest).await.is_err());
+    assert_eq!(remote_sha(&dest, "main"), before);
+    git(&dest, &["fsck", "--strict"]);
+}

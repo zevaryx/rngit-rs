@@ -130,7 +130,30 @@ impl Transport for MockNode {
                             .filter_map(|v| gix::ObjectId::from_hex(v.as_str()?.as_bytes()).ok())
                             .find(|id| repo.find_object(*id).is_ok())
                     });
-                Response::File { data: bundle::build(&repo, &name, have).unwrap(), metadata: Some(vec![0x81, 0x01, 0x00]) }
+                // A real node answers with one bundle holding every ref asked for.
+                let data = if refs.len() > 1 {
+                    let mut args = vec!["bundle".to_string(), "create".into(), "-".into()];
+                    args.extend(refs.iter().map(|r| MapRef::new(r).unwrap().str("ref").unwrap()));
+                    args.extend(have.map(|id| format!("^{id}")));
+                    let out = std::process::Command::new("git").current_dir(repo.git_dir()).args(&args).output().unwrap();
+                    if out.status.success() {
+                        out.stdout
+                    } else {
+                        // Git won't make a bundle of nothing; a node sends the header alone.
+                        let mut data = b"# v2 git bundle\n".to_vec();
+                        data.extend(have.map(|id| format!("-{id} have\n")).unwrap_or_default().into_bytes());
+                        for r in &refs {
+                            let name = MapRef::new(r).unwrap().str("ref").unwrap();
+                            let id = repo.find_reference(name.as_str()).unwrap().id();
+                            data.extend(format!("{id} {name}\n").into_bytes());
+                        }
+                        data.push(b'\n');
+                        data
+                    }
+                } else {
+                    bundle::build(&repo, &name, have).unwrap()
+                };
+                Response::File { data, metadata: Some(vec![0x81, 0x01, 0x00]) }
             }
             "/git/delete" => {
                 let name = field(&request, "ref").and_then(|v| v.as_str()).unwrap_or_default().to_string();
