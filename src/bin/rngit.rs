@@ -54,12 +54,16 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(result?)
 }
 
-/// `rngit serve DIR [RULES]`: answer rngit requests from the repositories in
+/// `rngit serve DIR [RULES] [--prune]`: answer rngit requests from the repositories in
 /// DIR (`group/name.git`) until stopped. RULES are read for every group, as in
 /// `.allowed` files; the default is `r:none`, so only `.allowed` files let anyone in.
+/// `--prune` has syncs drop the branches and tags their source dropped.
 async fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let prune = args.iter().any(|a| a == "--prune");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--prune").cloned().collect();
     let dir = args.first().ok_or("missing DIR; try `rngit help`")?;
     let mut node = rngit::server::Node::new(dir.into());
+    node.prune_synced = prune;
     node.default_rules = rngit::server::Rule::parse(args.get(1).map_or("", String::as_str));
     let session = Session::start(Duration::from_secs(1)).await?;
     let config = std::env::var_os("RNGIT_CONFIG").map(std::path::PathBuf::from);

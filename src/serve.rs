@@ -108,14 +108,30 @@ impl std::fmt::Debug for Reticulum {
     }
 }
 
-impl Upstream for Reticulum {
-    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+impl Reticulum {
+    /// What to ask `source` with, and the runtime to wait on.
+    fn client(&self, source: &RepoUrl, timeout: std::time::Duration) -> Result<(tokio::runtime::Handle, Client<RnsTransport>), String> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| "No runtime to fetch on")?;
         if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
             return Err("This node can't fetch from other nodes while it runs on one thread".into());
         }
         let transport = RnsTransport::new(self.runtime.clone(), self.identity.clone(), source.destination).with_request_timeout(timeout);
-        let client = Client::new(transport).with_limits(self.limits.clone());
+        Ok((handle, Client::new(transport).with_limits(self.limits.clone())))
+    }
+}
+
+impl Upstream for Reticulum {
+    fn refs(&self, source: &RepoUrl, timeout: std::time::Duration) -> Result<Vec<String>, String> {
+        let (handle, client) = self.client(source, timeout)?;
+        match tokio::task::block_in_place(|| handle.block_on(tokio::time::timeout(timeout, client.list(source, false)))) {
+            Ok(Ok(listed)) => Ok(listed.refs.into_iter().map(|(_, name)| name).collect()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("The source took too long".into()),
+        }
+    }
+
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+        let (handle, client) = self.client(source, timeout)?;
         let fetched = tokio::task::block_in_place(|| handle.block_on(tokio::time::timeout(timeout, client.clone_into(source, dest))));
         match fetched {
             Ok(Ok(_)) => Ok(()),
