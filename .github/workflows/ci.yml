@@ -1,9 +1,9 @@
 name: CI
 
-# Lint and test every push to main and every pull request.
+# Lint and test every push to main and dev, and every pull request.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
