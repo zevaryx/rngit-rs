@@ -655,3 +655,17 @@ async fn push_all_of_an_empty_repository_sends_nothing() {
     let client = Client::new(MockNode::new(server));
     assert_eq!(client.push_all(&url(), &empty, false, false).await.unwrap(), rngit::PushReport::default());
 }
+
+#[tokio::test]
+async fn a_repository_called_dot_git_is_asked_for_by_that_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = tmp.path().join("server.git");
+    bare_repo(&server);
+    let client = Client::new(MockNode::new(server));
+    let dotted: RepoUrl = "rns://727ca184e3d7e83e0e35146940920442/BASH_BLOG/.git".parse().unwrap();
+    let _ = client.list(&dotted, false).await;
+    let (path, request) = client.transport().requests().remove(0);
+    assert_eq!(path, "/git/list");
+    let asked = request.as_map().unwrap().iter().find(|(k, _)| k.as_u64() == Some(0)).and_then(|(_, v)| v.as_str());
+    assert_eq!(asked, Some("BASH_BLOG/.git"));
+}
