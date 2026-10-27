@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use rngit::error::{Error, Status};
-use rngit::server::{NULL_IDENT, Node, Rule, Who};
+use rngit::server::{NULL_IDENT, Node, Rule, Sender, Who};
 use rngit::{Client, RepoUrl, Response, Transport};
 
 const ME: [u8; 16] = [7; 16];
@@ -11,11 +11,15 @@ const ME: [u8; 16] = [7; 16];
 struct Direct {
     node: Node,
     peer: Option<[u8; 16]>,
+    /// The public key of the identity that sends, if it is known.
+    key: Option<[u8; 64]>,
 }
 
 impl Transport for Direct {
     async fn request(&self, path: &str, data: Vec<u8>) -> Result<Response, Error> {
-        self.node.handle(path, &data, self.peer).ok_or_else(|| Error::Transport("unknown path".into()))
+        self.node
+            .handle_from(path, &data, self.peer.map(|hash| Sender { hash, key: self.key }))
+            .ok_or_else(|| Error::Transport("unknown path".into()))
     }
 }
 
@@ -69,7 +73,7 @@ fn rules_read_both_separators_and_skip_what_they_cannot() {
 #[tokio::test]
 async fn a_client_clones_and_then_fetches_only_what_is_new() {
     let (tmp, node, work) = node("r:all");
-    let client = Client::new(Direct { node, peer: Some(ME) });
+    let client = Client::new(Direct { node, peer: Some(ME), key: None });
     let dest = tmp.path().join("clone.git");
     let refs = client.clone_into(&url(), &dest).await.unwrap();
     assert_eq!(refs.head.as_deref(), Some("refs/heads/main"));
@@ -93,14 +97,17 @@ async fn a_client_clones_and_then_fetches_only_what_is_new() {
 
 #[test]
 fn who_may_read_is_decided_by_the_rules() {
-    let (_tmp, mut node, _) = node(&format!("r:{}", hex::encode(ME)));
+    let (tmp, mut node, _) = node(&format!("r:{}", hex::encode(ME)));
     let list = rmpv_request("public/demo.git", &[]);
     // The named identity reads, another one and an unidentified peer see nothing.
     assert_eq!(text(&node.handle("/git/list", &list, Some(ME)).unwrap()).0, 0);
     assert_eq!(text(&node.handle("/git/list", &list, Some([9; 16])).unwrap()), (3, "Not found".into()));
     assert_eq!(text(&node.handle("/git/list", &list, None).unwrap()).0, 3);
-    // A group rule from the node's settings reaches repositories without their own rule.
+    // A group rule from the node's settings doesn't reach a repository that names who reads it, as in stock rngit...
     node.group_rules.insert("public".into(), Rule::parse("r:all"));
+    assert_eq!(text(&node.handle("/git/list", &list, Some([9; 16])).unwrap()).0, 3);
+    // ...but it reaches one that says nothing of reading.
+    std::fs::write(tmp.path().join("repos/public/demo.git.allowed"), format!("w:{}", hex::encode(ME))).unwrap();
     assert_eq!(text(&node.handle("/git/list", &list, Some([9; 16])).unwrap()).0, 0);
     // Blocked wins over every rule.
     node.blocked.insert(ME);
@@ -115,7 +122,7 @@ fn writes_are_refused_and_listing_for_push_needs_write() {
     let (_tmp, node, _) = node("r:all");
     let push = rmpv_request("public/demo.git", &[("for_push", rmpv::Value::Boolean(true))]);
     assert_eq!(text(&node.handle("/git/list", &push, Some(ME)).unwrap()), (3, "Not allowed".into()));
-    for path in ["/git/push", "/git/create", "/git/delete", "/mgmt/perms", "/mgmt/work"] {
+    for path in ["/git/push", "/git/create", "/git/delete"] {
         assert_eq!(text(&node.handle(path, &push, Some(ME)).unwrap()).0, Status::NotAllowed.to_byte(), "{path}");
     }
     assert!(node.handle("/nothing", &push, Some(ME)).is_none());
@@ -239,7 +246,7 @@ async fn a_client_makes_a_repository_pushes_to_it_and_deletes_refs() {
     let (tmp, node) = open_node();
     let work = tmp.path().join("work");
     work_repo(&work, 2);
-    let client = Client::new(Direct { node, peer: Some(ME) });
+    let client = Client::new(Direct { node, peer: Some(ME), key: None });
     client.create(&new_url()).await.unwrap();
     assert_eq!(std::fs::read_to_string(tmp.path().join("repos/public/new.git.allowed")).unwrap(), format!("adm:{}", hex::encode(ME)));
     let empty = client.list(&new_url(), true).await.unwrap();
@@ -461,7 +468,7 @@ async fn released(client: &Client<Direct>, tag: &str, files: &[(String, Vec<u8>)
 #[tokio::test]
 async fn releases_are_made_listed_fetched_made_latest_and_deleted() {
     let (tmp, node, _) = node(&format!("r:all\nrel:{}", hex::encode(ME)));
-    let me = Client::new(Direct { node: node.clone(), peer: Some(ME) });
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
     let files = vec![("app.txt".to_string(), b"the app".to_vec()), ("lib.bin".to_string(), vec![1, 2, 3])];
 
     // Nothing yet: the list is an empty one, not an error.
@@ -514,11 +521,11 @@ async fn releases_are_made_listed_fetched_made_latest_and_deleted() {
 #[tokio::test]
 async fn releasing_needs_the_permission_and_everyone_identified() {
     let (_tmp, node, _) = node(&format!("r:all\nrel:{}", hex::encode(ME)));
-    let me = Client::new(Direct { node: node.clone(), peer: Some(ME) });
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
     released(&me, "v1", &[("a".into(), b"a".to_vec())]).await.unwrap();
 
     // A reader sees them; changing needs `rel`.
-    let reader = Client::new(Direct { node: node.clone(), peer: Some([9; 16]) });
+    let reader = Client::new(Direct { node: node.clone(), peer: Some([9; 16]), key: None });
     assert_eq!(reader.releases(&url()).await.unwrap().releases.len(), 1);
     assert_eq!(reader.fetch_artifact(&url(), "v1", "a").await.unwrap(), b"a");
     for error in [
@@ -530,11 +537,11 @@ async fn releasing_needs_the_permission_and_everyone_identified() {
     }
 
     // Someone who didn't identify themselves gets nothing, as stock does.
-    let anonymous = Client::new(Direct { node: node.clone(), peer: None });
+    let anonymous = Client::new(Direct { node: node.clone(), peer: None, key: None });
     assert!(anonymous.releases(&url()).await.unwrap_err().to_string().contains("Not identified"));
     // Nor does someone who can't read the repository learn it has releases.
     let (_t, closed, _) = self::node("");
-    let stranger = Client::new(Direct { node: closed, peer: Some([9; 16]) });
+    let stranger = Client::new(Direct { node: closed, peer: Some([9; 16]), key: None });
     assert!(stranger.releases(&url()).await.unwrap_err().to_string().contains("Not found"));
 }
 
@@ -599,4 +606,189 @@ fn what_is_asked_of_releases_is_checked_before_anything_is_read() {
     assert_eq!(ask(&[("operation", "list".into())]).0, 0);
     let elsewhere = node.handle("/mgmt/release", &rmpv_request("../etc/x.git", &[("operation", "list".into())]), Some(ME)).unwrap();
     assert_eq!(text(&elsewhere).0, 3);
+}
+
+/// A client that is `key`'s identity.
+fn as_key(node: &Node, key: &Key) -> Client<Direct> {
+    use rngit::sign::Signer;
+    Client::new(Direct { node: node.clone(), peer: Some(key.identity_hash()), key: Some(key.public_key()) })
+}
+
+fn hash_of(key: &Key) -> String {
+    use rngit::sign::Signer;
+    hex::encode(key.identity_hash())
+}
+
+#[tokio::test]
+async fn work_documents_are_written_read_commented_moved_and_deleted() {
+    use rngit::client::{WorkKind, WorkScope};
+    let (amy, ben) = (Key::new(1), Key::new(2));
+    // Amy runs the repository; anyone may read, comment and propose.
+    let (tmp, node, _) = node(&format!("r:all\ni:all\np:all\nadm:{}", hash_of(&amy)));
+    let (a, b) = (as_key(&node, &amy), as_key(&node, &ben));
+    let none = a.work_list(&url(), WorkScope::All).await.unwrap();
+    assert!(none.active.is_empty() && none.completed.is_empty() && none.proposed.is_empty());
+
+    // Amy writes a document; it's active, and what a reader gets verifies against her key.
+    let (id, scope) = a.work_create(&url(), &amy, WorkKind::Create, "First", "The plan\n", "markdown").await.unwrap();
+    assert_eq!((id, scope.as_str()), (1, "active"));
+    let doc = b.work_view(&url(), 1, WorkScope::All).await.unwrap();
+    assert_eq!((doc.title.as_str(), doc.content.as_str(), doc.scope.as_str()), ("First", "The plan", "active"));
+    assert!(doc.verified && doc.author == hash_of(&amy), "{doc:?}");
+    let list = b.work_list(&url(), WorkScope::Active).await.unwrap();
+    assert_eq!((list.active.len(), list.active[0].comments, list.active[0].author.as_str()), (1, 0, hash_of(&amy).as_str()));
+    // On disk as stock keeps it.
+    assert!(tmp.path().join("repos/public/demo.git.work/active/1/root").is_file());
+
+    // Ben may comment and propose, but not write one of his own.
+    assert_eq!(b.work_comment(&url(), 1, WorkScope::Active, "Looks good", "markdown").await.unwrap(), 1);
+    assert!(tmp.path().join("repos/public/demo.git.work/active/1/1").is_file());
+    let refused = b.work_create(&url(), &ben, WorkKind::Create, "Mine", "Text", "markdown").await.unwrap_err().to_string();
+    assert!(refused.to_lowercase().contains("not allowed"), "{refused}");
+    let (proposed, scope) = b.work_create(&url(), &ben, WorkKind::Propose, "Idea", "Do it", "markdown").await.unwrap();
+    assert_eq!((proposed, scope.as_str()), (2, "proposed"));
+    let allowed = std::fs::read_to_string(tmp.path().join("repos/public/demo.git.work/2.allowed")).unwrap();
+    assert_eq!(allowed, format!("i:{0}\nw:{0}\n", hash_of(&ben)));
+    let viewed = a.work_view(&url(), 1, WorkScope::All).await.unwrap();
+    assert_eq!(viewed.comments.len(), 1);
+    assert_eq!(a.work_list(&url(), WorkScope::All).await.unwrap().active[0].comments, 1);
+
+    // Ben edits his proposal (only its author may; Amy may not edit his words), and Amy takes it up.
+    b.work_edit(&url(), &ben, 2, WorkScope::Proposed, "Idea!", "Do it now").await.unwrap();
+    let edited = b.work_view(&url(), 2, WorkScope::All).await.unwrap();
+    assert_eq!((edited.title.as_str(), edited.content.as_str()), ("Idea!", "Do it now"));
+    assert!(edited.verified && edited.edited >= edited.created);
+    let not_author = a.work_edit(&url(), &amy, 2, WorkScope::Proposed, "Mine now", "Stolen").await.unwrap_err().to_string();
+    assert!(not_author.contains("not author"), "{not_author}");
+    assert_eq!(a.work_activate(&url(), 2).await.unwrap(), (2, "active".into()));
+    assert!(tmp.path().join("repos/public/demo.git.work/active/2/root").is_file());
+    assert!(!tmp.path().join("repos/public/demo.git.work/proposed/2").exists());
+
+    // Completed, and active again; only its author or an administrator may.
+    assert_eq!(a.work_complete(&url(), 1).await.unwrap(), (1, "completed".into()));
+    assert_eq!(a.work_list(&url(), WorkScope::All).await.unwrap().completed.len(), 1);
+    assert_eq!(a.work_activate(&url(), 1).await.unwrap().1, "active");
+    assert!(b.work_complete(&url(), 1).await.is_err());
+
+    // Deleted: the document, its comments and its rules go.
+    b.work_delete(&url(), 2, WorkScope::Active).await.unwrap_err();
+    a.work_delete(&url(), 2, WorkScope::Active).await.unwrap();
+    assert!(!tmp.path().join("repos/public/demo.git.work/active/2").exists());
+    assert!(!tmp.path().join("repos/public/demo.git.work/2.allowed").exists());
+    assert!(a.work_view(&url(), 2, WorkScope::All).await.is_err());
+    // The next number is past every one used.
+    let (next, _) = a.work_create(&url(), &amy, WorkKind::Create, "Third", "More", "markdown").await.unwrap();
+    assert_eq!(next, 2);
+}
+
+#[tokio::test]
+async fn what_is_written_has_to_be_signed_by_the_sender_and_fit() {
+    use rngit::client::{WorkKind, WorkScope};
+    let (amy, ben) = (Key::new(1), Key::new(2));
+    let (_tmp, node, _) = node(&format!("r:all\nadm:{}", hash_of(&amy)));
+    let a = as_key(&node, &amy);
+    // Signed by someone else, or sent by a link whose key isn't known.
+    let wrong = a.work_create(&url(), &ben, WorkKind::Create, "T", "Text", "markdown").await.unwrap_err().to_string();
+    assert!(wrong.contains("Invalid signature"), "{wrong}");
+    let unknown =
+        Client::new(Direct { node: node.clone(), peer: Some(hex::decode(hash_of(&amy)).unwrap().try_into().unwrap()), key: None });
+    assert!(unknown.work_create(&url(), &amy, WorkKind::Create, "T", "Text", "markdown").await.is_err());
+    // A key that isn't the sender's.
+    let borrowed = {
+        use rngit::sign::Signer;
+        Client::new(Direct { node: node.clone(), peer: Some(amy.identity_hash()), key: Some(ben.public_key()) })
+    };
+    assert!(borrowed.work_create(&url(), &ben, WorkKind::Create, "T", "Text", "markdown").await.is_err());
+    // Nothing without a title or text, and nothing too long.
+    assert!(
+        a.work_create(&url(), &amy, WorkKind::Create, " ", "Text", "markdown").await.unwrap_err().to_string().contains("Title is required")
+    );
+    assert!(
+        a.work_create(&url(), &amy, WorkKind::Create, "T", "  ", "markdown").await.unwrap_err().to_string().contains("Content is required")
+    );
+    let long = "x".repeat(256 * 1024);
+    assert!(a.work_create(&url(), &amy, WorkKind::Create, "T", &long, "markdown").await.unwrap_err().to_string().contains("limit"));
+    assert!(a.work_list(&url(), WorkScope::All).await.unwrap().active.is_empty());
+    // Someone who didn't identify themselves is turned away.
+    let anonymous = Client::new(Direct { node: node.clone(), peer: None, key: None });
+    assert!(anonymous.work_list(&url(), WorkScope::All).await.unwrap_err().to_string().contains("Not identified"));
+}
+
+#[test]
+fn odd_work_requests_are_answered_and_leave_nothing_behind() {
+    let amy = Key::new(1);
+    let (tmp, node, _) = node(&format!("r:all\nadm:{}", hash_of(&amy)));
+    let sender = {
+        use rngit::sign::Signer;
+        Sender { hash: amy.identity_hash(), key: Some(amy.public_key()) }
+    };
+    let ask = |extra: &[(&str, rmpv::Value)]| {
+        text(&node.handle_from("/mgmt/work", &rmpv_request("public/demo.git", extra), Some(sender)).unwrap())
+    };
+    assert_eq!(ask(&[]).0, 2);
+    assert_eq!(ask(&[("operation", "explode".into())]).0, 1);
+    // Documents by numbers that aren't, or aren't there, or that name a folder.
+    for id in [rmpv::Value::from("../../x"), rmpv::Value::from(-1), rmpv::Value::Boolean(true), rmpv::Value::from(u64::MAX)] {
+        let reply = ask(&[("operation", "view".into()), ("doc_id", id.clone())]);
+        assert!(matches!(reply.0, 2 | 3), "{id:?}: {reply:?}");
+    }
+    assert_eq!(ask(&[("operation", "view".into()), ("doc_id", 1.into()), ("scope", "everywhere".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "view".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "delete".into()), ("doc_id", 5.into())]).0, 3);
+    assert_eq!(ask(&[("operation", "list".into()), ("scope", "everywhere".into())]).0, 0);
+    // A comment on nothing, and a document that was never signed.
+    assert_eq!(ask(&[("operation", "comment".into()), ("doc_id", 5.into()), ("content", "hi".into())]).0, 3);
+    assert_eq!(ask(&[("operation", "create".into()), ("title", "t".into()), ("content", "c".into())]).0, 2);
+    assert!(!tmp.path().join("repos/public/demo.git.work").exists());
+}
+
+#[tokio::test]
+async fn who_may_change_a_documents_rules_and_what_they_say() {
+    use rngit::client::{WorkKind, WorkScope};
+    let (amy, ben, cat) = (Key::new(1), Key::new(2), Key::new(3));
+    let (_tmp, node, _) = node(&format!("r:all\ni:all\np:all\nadm:{}", hash_of(&amy)));
+    let (a, b, c) = (as_key(&node, &amy), as_key(&node, &ben), as_key(&node, &cat));
+    b.work_create(&url(), &ben, WorkKind::Propose, "Idea", "Text", "markdown").await.unwrap();
+
+    // Amy, an administrator, reads what the proposal gives its author, and changes it.
+    assert_eq!(a.work_perms(&url(), 1).await.unwrap(), format!("i:{0}\nw:{0}\n", hash_of(&ben)));
+    a.set_work_perms(&url(), 1, &format!("i:{}\nw:{}\nr:none", hash_of(&ben), hash_of(&ben))).await.unwrap();
+    // With reading shut for everyone else on that document, Cat no longer sees it (Ben does, and so does Amy).
+    assert!(c.work_view(&url(), 1, WorkScope::All).await.is_err());
+    assert!(c.work_list(&url(), WorkScope::All).await.unwrap().proposed.is_empty());
+    assert!(a.work_view(&url(), 1, WorkScope::All).await.is_ok());
+    // Ben is no administrator of the repository, so the rules aren't his to read.
+    assert!(b.work_perms(&url(), 1).await.is_err());
+    // A rule that isn't one is refused, with the line.
+    let bad = a.set_work_perms(&url(), 1, "i:all\nsomething else").await.unwrap_err().to_string();
+    assert!(bad.contains("Invalid permission \"something else\" on line 2"), "{bad}");
+    assert!(a.set_work_perms(&url(), 1, "r:all, w:all").await.is_err());
+
+    // The repository's and the group's, as only their administrators may.
+    assert!(a.repo_perms(&url()).await.unwrap().contains("adm:"));
+    a.set_repo_perms(&url(), &format!("# who may\nr:all\ni:all\np:all\nadm:{}\n", hash_of(&amy))).await.unwrap();
+    assert!(b.repo_perms(&url()).await.is_err());
+    assert!(b.set_repo_perms(&url(), "r:all").await.is_err());
+    assert!(a.set_repo_perms(&url(), "nonsense").await.unwrap_err().to_string().contains("Invalid permission"));
+    // Nobody administers the group yet.
+    assert!(a.group_perms("public").await.is_err());
+}
+
+#[tokio::test]
+async fn a_group_is_administered_from_the_file_beside_it() {
+    let (amy, ben) = (Key::new(1), Key::new(2));
+    let (tmp, node, _) = node("r:all");
+    std::fs::write(tmp.path().join("repos/public.allowed"), format!("adm:{}", hash_of(&amy))).unwrap();
+    let (a, b) = (as_key(&node, &amy), as_key(&node, &ben));
+    assert_eq!(a.group_perms("public").await.unwrap(), format!("adm:{}", hash_of(&amy)));
+    // Ben reads the repository but isn't the group's administrator.
+    assert!(b.group_perms("public").await.unwrap_err().to_string().contains("Not found"));
+    assert!(b.set_group_perms("public", "c:all").await.is_err());
+    a.set_group_perms("public", &format!("adm:{}\nc:all\n", hash_of(&amy))).await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path().join("repos/public.allowed")).unwrap(), format!("adm:{}\nc:all\n", hash_of(&amy)));
+    // And the rule it set works: Ben may make a repository there.
+    b.create(&"rns://00112233445566778899aabbccddeeff/public/new".parse().unwrap()).await.unwrap();
+    // A group that isn't there, or isn't a name.
+    assert!(a.group_perms("nowhere").await.is_err());
+    assert!(a.group_perms("../public").await.is_err());
 }

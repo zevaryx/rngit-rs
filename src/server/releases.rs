@@ -13,11 +13,9 @@
 //! A release is made in steps (`init`, then `artifact` for each file, then
 //! `finalize`) and can only be written while it is a draft.
 
-use std::io::Write as _;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rmpv::Value;
 
+use super::support::{now, packed, refuse, text, write_file};
 use super::{Node, Perm, Refusal, ack, dir_size, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -29,10 +27,6 @@ const MAX_RELEASES: usize = 1000;
 const MAX_META_BYTES: u64 = 16 * 1024;
 /// Longest notes read back, or taken.
 const MAX_NOTES_BYTES: usize = 256 * 1024;
-
-fn refuse(status: Status, text: &str) -> Refusal {
-    Refusal::new(status, text)
-}
 
 /// A tag as a release folder's name: letters, digits and `._-+`, and not
 /// a name that means a folder up.
@@ -50,10 +44,6 @@ fn plain_artifact(name: &str) -> bool {
         && !name.starts_with('.')
         && !name.contains(['/', '\\', '\0'])
         && !name.chars().any(char::is_control)
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// The `META` of a release, as lines of `key = value`.
@@ -78,18 +68,6 @@ fn meta_get<'a>(meta: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn write_meta(release: &std::path::Path, meta: &[(String, String)]) -> std::io::Result<()> {
     let text: String = meta.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
     write_file(&release.join("META"), text.as_bytes())
-}
-
-/// Write a file by way of a temporary one, so a failure leaves nothing half written.
-fn write_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_file_name(format!(".{}.part", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
 }
 
 /// The notes of a release, and their format.
@@ -121,16 +99,6 @@ fn artifacts(release: &std::path::Path) -> Vec<(String, u64)> {
     found.sort();
     found.truncate(1000);
     found
-}
-
-fn packed(value: &Value) -> Result<Response, Refusal> {
-    let mut out = vec![Status::Ok.to_byte()];
-    rmpv::encode::write_value(&mut out, value).map_err(|_| refuse(Status::ServerError, "Remote error"))?;
-    Ok(Response::Packet(out))
-}
-
-fn text(value: &str) -> Value {
-    Value::from(value)
 }
 
 impl Node {
