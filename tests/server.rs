@@ -42,9 +42,18 @@ fn url() -> RepoUrl {
     "rns://00112233445566778899aabbccddeeff/public/demo".parse().unwrap()
 }
 
+/// rsReticulum sends a reply that is one whole MessagePack value as that value, not as bytes.
+fn whole_msgpack(bytes: &[u8]) -> bool {
+    let mut cursor = std::io::Cursor::new(bytes);
+    rmpv::decode::read_value(&mut cursor).is_ok() && cursor.position() as usize == bytes.len()
+}
+
 fn text(response: &Response) -> (u8, String) {
     match response {
-        Response::Packet(p) => (p[0], String::from_utf8_lossy(&p[1..]).into_owned()),
+        Response::Packet(p) => {
+            assert!(!whole_msgpack(p), "{p:?} would be sent as a number, not as bytes");
+            (p[0], String::from_utf8_lossy(&p[1..]).into_owned())
+        }
         Response::File { .. } => (0, "file".into()),
     }
 }
@@ -206,4 +215,217 @@ fn building_stops_when_told_to() {
     assert!(rngit::bundle::build_many_until(&repo, &[("refs/heads/main", None)], &[], &stop).is_err());
     let go = std::sync::atomic::AtomicBool::new(false);
     assert!(rngit::bundle::build_many_until(&repo, &[("refs/heads/main", None)], &[], &go).is_ok());
+}
+
+/// A node whose `public` group lets anyone make repositories.
+fn open_node() -> (tempfile::TempDir, Node) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("repos/public")).unwrap();
+    let mut node = Node::new(tmp.path().join("repos"));
+    node.default_rules = Rule::parse("c:all");
+    (tmp, node)
+}
+
+fn new_url() -> RepoUrl {
+    "rns://00112233445566778899aabbccddeeff/public/new".parse().unwrap()
+}
+
+fn served(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    tmp.path().join("repos/public/new.git")
+}
+
+#[tokio::test]
+async fn a_client_makes_a_repository_pushes_to_it_and_deletes_refs() {
+    let (tmp, node) = open_node();
+    let work = tmp.path().join("work");
+    work_repo(&work, 2);
+    let client = Client::new(Direct { node, peer: Some(ME) });
+    client.create(&new_url()).await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path().join("repos/public/new.git.allowed")).unwrap(), format!("adm:{}", hex::encode(ME)));
+    let empty = client.list(&new_url(), true).await.unwrap();
+    assert!((empty.refs.is_empty(), empty.head.as_deref()) == (true, Some("refs/heads/master")));
+
+    // A branch, then it moving forward, a tag and a second branch.
+    client.push_from(&new_url(), &work, "refs/heads/main", "refs/heads/main", false).await.unwrap();
+    assert_eq!(git(&served(&tmp), &["rev-parse", "main"]), git(&work, &["rev-parse", "main"]));
+    std::fs::write(work.join("more.txt"), "more").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "more"]);
+    client.push_from(&new_url(), &work, "refs/heads/main", "refs/heads/main", false).await.unwrap();
+    git(&work, &["tag", "-a", "-m", "annotated", "v1"]);
+    client.push_from(&new_url(), &work, "refs/tags/v1", "refs/tags/v1", false).await.unwrap();
+    client.push_from(&new_url(), &work, "refs/heads/main", "refs/heads/feature", false).await.unwrap();
+    let served_repo = served(&tmp);
+    assert_eq!(git(&served_repo, &["rev-parse", "main"]), git(&work, &["rev-parse", "main"]));
+    assert_eq!(git(&served_repo, &["cat-file", "-t", "v1"]), "tag");
+    git(&served_repo, &["fsck", "--strict"]);
+
+    // Cloning it back gives what was pushed.
+    let dest = tmp.path().join("back.git");
+    client.clone_into(&new_url(), &dest).await.unwrap();
+    assert_eq!(git(&dest, &["rev-parse", "feature"]), git(&work, &["rev-parse", "main"]));
+
+    // A branch that is no ancestor needs force.
+    git(&work, &["reset", "-q", "--hard", "HEAD~1"]);
+    std::fs::write(work.join("other.txt"), "other").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "diverged"]);
+    let before = git(&served_repo, &["rev-parse", "main"]);
+    assert!(client.push_from(&new_url(), &work, "refs/heads/main", "refs/heads/main", false).await.is_err());
+    client.push_from(&new_url(), &work, "refs/heads/main", "refs/heads/main", true).await.unwrap();
+    assert_ne!(git(&served_repo, &["rev-parse", "main"]), before);
+
+    // Deleting a ref, and one that isn't there.
+    client.delete_ref(&new_url(), "refs/heads/feature").await.unwrap();
+    client.delete_ref(&new_url(), "refs/heads/never-was").await.unwrap();
+    assert!(!git(&served_repo, &["branch", "--list", "feature"]).contains("feature"));
+
+    // Pointing a ref at an object the repository has, and at one it hasn't.
+    let main = git(&served_repo, &["rev-parse", "main"]).parse().unwrap();
+    client.update_ref(&new_url(), "refs/tags/again", main, false).await.unwrap();
+    assert_eq!(git(&served_repo, &["rev-parse", "again"]), main.to_string());
+    let missing = "1".repeat(40).parse().unwrap();
+    let error = client.update_ref(&new_url(), "refs/tags/nope", missing, false).await.unwrap_err().to_string();
+    assert!(error.contains("does not exist in repository"), "{error}");
+}
+
+#[test]
+fn what_a_peer_may_change_follows_the_rules() {
+    let (tmp, node) = open_node();
+    let make = rmpv_request("public/new.git", &[]);
+    // Not telling who you are, or no create rule: no repository.
+    assert_eq!(text(&node.handle("/git/create", &make, None).unwrap()), (1, "Not allowed".into()));
+    assert_eq!(text(&node.handle("/git/create", &make, Some(ME)).unwrap()), (0, "\0".into()));
+    assert_eq!(text(&node.handle("/git/create", &make, Some(ME)).unwrap()), (1, "Repository already exists".into()));
+    assert_eq!(text(&node.handle("/git/create", &rmpv_request("nowhere/new.git", &[]), Some(ME)).unwrap()), (3, "Not found".into()));
+    for odd in ["public/../x.git", "public/x", "x.git", "public/.git"] {
+        assert_ne!(text(&node.handle("/git/create", &rmpv_request(odd, &[]), Some(ME)).unwrap()).0, 0, "{odd}");
+    }
+    assert_eq!(std::fs::read_dir(tmp.path().join("repos/public")).unwrap().count(), 2);
+
+    // The creator may write; someone who may only read may not; someone who may do neither doesn't see it.
+    std::fs::write(tmp.path().join("repos/public/new.git.allowed"), format!("adm:{}\nr:{}", hex::encode(ME), hex::encode([8; 16])))
+        .unwrap();
+    let delete = rmpv_request("public/new.git", &[("ref", rmpv::Value::from("refs/heads/x"))]);
+    assert_eq!(text(&node.handle("/git/delete", &delete, Some(ME)).unwrap()).0, 0);
+    assert_eq!(text(&node.handle("/git/delete", &delete, Some([8; 16])).unwrap()), (1, "Not allowed".into()));
+    assert_eq!(text(&node.handle("/git/delete", &delete, Some([9; 16])).unwrap()), (3, "Not found".into()));
+    let odd = rmpv_request("public/new.git", &[("ref", rmpv::Value::from("refs/rngit/x"))]);
+    assert_eq!(text(&node.handle("/git/delete", &odd, Some(ME)).unwrap()).0, 2);
+    let head = rmpv_request("public/new.git", &[("ref", rmpv::Value::from("HEAD"))]);
+    assert_eq!(text(&node.handle("/git/delete", &head, Some(ME)).unwrap()).0, 2);
+}
+
+#[test]
+fn the_node_refuses_a_divergent_bundle_and_leaves_the_ref() {
+    let (tmp, node) = open_node();
+    let work = tmp.path().join("work");
+    work_repo(&work, 2);
+    assert_eq!(text(&node.handle("/git/create", &rmpv_request("public/new.git", &[]), Some(ME)).unwrap()).0, 0);
+    let repo = gix::open(&work).unwrap();
+    let push = |refname: &str, force: bool, node: &Node| {
+        let bundle = rngit::bundle::build(&repo, "refs/heads/main", None).unwrap();
+        let request = rmpv_request(
+            "public/new.git",
+            &[
+                ("local_ref", rmpv::Value::from("refs/heads/main")),
+                ("remote_ref", rmpv::Value::from(refname)),
+                ("force", rmpv::Value::Boolean(force)),
+                ("bundle", rmpv::Value::Binary(bundle)),
+            ],
+        );
+        text(&node.handle("/git/push", &request, Some(ME)).unwrap())
+    };
+    assert_eq!(push("refs/heads/main", false, &node).0, 0);
+    let first = git(&served(&tmp), &["rev-parse", "main"]);
+    // The same again is fine; a bundle of something unrelated isn't, unless forced.
+    assert_eq!(push("refs/heads/main", false, &node).0, 0);
+    git(&work, &["checkout", "-q", "--orphan", "other"]);
+    std::fs::write(work.join("x.txt"), "x").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "unrelated"]);
+    git(&work, &["branch", "-f", "main"]);
+    let repo = gix::open(&work).unwrap();
+    let push = |refname: &str, force: bool| {
+        let bundle = rngit::bundle::build(&repo, "refs/heads/main", None).unwrap();
+        let request = rmpv_request(
+            "public/new.git",
+            &[("remote_ref", rmpv::Value::from(refname)), ("force", rmpv::Value::Boolean(force)), ("bundle", rmpv::Value::Binary(bundle))],
+        );
+        text(&node.handle("/git/push", &request, Some(ME)).unwrap())
+    };
+    assert_eq!(push("refs/heads/main", false), (0xff, "Could not verify bundle".into()));
+    assert_eq!(git(&served(&tmp), &["rev-parse", "main"]), first);
+    // Not a branch or a tag; a bundle that isn't one.
+    assert_eq!(push("refs/rngit/x", true).0, 2);
+    let junk = rmpv_request(
+        "public/new.git",
+        &[("remote_ref", rmpv::Value::from("refs/heads/j")), ("bundle", rmpv::Value::Binary(b"junk".to_vec()))],
+    );
+    assert_eq!(text(&node.handle("/git/push", &junk, Some(ME)).unwrap()), (0xff, "Could not verify bundle".into()));
+    assert_eq!(push("refs/heads/main", true).0, 0);
+    assert_ne!(git(&served(&tmp), &["rev-parse", "main"]), first);
+}
+
+#[test]
+fn quotas_stop_a_push_that_is_too_big() {
+    let (tmp, mut node) = open_node();
+    let work = tmp.path().join("work");
+    work_repo(&work, 3);
+    node.handle("/git/create", &rmpv_request("public/new.git", &[]), Some(ME)).unwrap();
+    let repo = gix::open(&work).unwrap();
+    let bundle = rngit::bundle::build(&repo, "refs/heads/main", None).unwrap();
+    let push = |node: &Node| {
+        let request = rmpv_request(
+            "public/new.git",
+            &[("remote_ref", rmpv::Value::from("refs/heads/main")), ("bundle", rmpv::Value::Binary(bundle.clone()))],
+        );
+        text(&node.handle("/git/push", &request, Some(ME)).unwrap())
+    };
+    let nothing = |node: &Node| assert!(node.handle("/git/list", &rmpv_request("public/new.git", &[]), Some(ME)).is_some());
+    node.quotas.max_push_bytes = bundle.len() - 1;
+    assert_eq!(push(&node), (2, "Bundle is too large".into()));
+    node.quotas.max_push_bytes = bundle.len();
+    node.quotas.max_repo_bytes = bundle.len() as u64;
+    assert_eq!(push(&node), (0xff, "Repository is full".into()));
+    node.quotas.max_repo_bytes = 1 << 30;
+    node.quotas.pack.max_objects = 2;
+    assert_eq!(push(&node), (0xff, "Could not verify bundle".into()));
+    node.quotas.pack.max_objects = 1000;
+    node.quotas.pack.max_total_bytes = 10;
+    assert_eq!(push(&node), (0xff, "Could not verify bundle".into()));
+    node.quotas.pack.max_total_bytes = 1 << 30;
+    node.quotas.pack.max_object_bytes = 10;
+    assert_eq!(push(&node), (0xff, "Could not verify bundle".into()));
+    nothing(&node);
+    assert!(git(&served(&tmp), &["for-each-ref"]).is_empty());
+    node.quotas.pack.max_object_bytes = 1 << 20;
+    assert_eq!(push(&node).0, 0);
+    // The groups hold only so many repositories.
+    node.quotas.max_repos_per_group = 1;
+    assert_eq!(text(&node.handle("/git/create", &rmpv_request("public/second.git", &[]), Some(ME)).unwrap()).0, 0xff);
+}
+
+#[test]
+fn a_delta_counts_as_the_object_it_makes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    let big = "the same line over and over\n".repeat(8000);
+    std::fs::write(work.join("big.txt"), &big).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "one"]);
+    std::fs::write(work.join("big.txt"), format!("{big}one more\n")).unwrap();
+    git(&work, &["commit", "-q", "-a", "-m", "two"]);
+    let repo = gix::open(&work).unwrap();
+    let bundle = rngit::bundle::build(&repo, "refs/heads/main", None).unwrap();
+    let header = rngit::bundle::parse_header(&bundle).unwrap();
+    let pack = &bundle[header.pack_offset..];
+    let limits = |total| rngit::bundle::PackLimits { max_objects: 100, max_object_bytes: 1 << 30, max_total_bytes: total };
+    let hash = repo.object_hash();
+    // Two files of 224,000 bytes and the rest: the second may be stored as a small delta.
+    assert!(rngit::bundle::check_pack(pack, hash, limits(1 << 30)).is_ok());
+    assert!(rngit::bundle::check_pack(pack, hash, limits(300_000)).is_err());
+    assert!(rngit::bundle::check_pack(&pack[..pack.len() / 2], hash, limits(1 << 30)).is_err());
 }
