@@ -161,3 +161,49 @@ fn rmpv_request(repo: &str, extra: &[(&str, rmpv::Value)]) -> Vec<u8> {
     rmpv::encode::write_value(&mut out, &rmpv::Value::Map(entries)).unwrap();
     out
 }
+
+fn fetch_of(refs: &[&str]) -> Vec<u8> {
+    let wanted = refs.iter().map(|n| rmpv::Value::Map(vec![(rmpv::Value::from("ref"), rmpv::Value::from(*n))])).collect::<Vec<_>>();
+    rmpv_request("public/demo.git", &[("refs", rmpv::Value::Array(wanted))])
+}
+
+#[test]
+fn a_bundle_built_lately_is_kept_until_a_ref_moves() {
+    let (tmp, node, work) = node("r:all");
+    let ask = fetch_of(&["refs/heads/main", "refs/tags/v1"]);
+    let first = node.handle("/git/fetch", &ask, Some(ME)).unwrap();
+    assert_eq!(node.cached_bundles(), 1);
+    assert_eq!(node.handle("/git/fetch", &ask, Some(ME)).unwrap(), first);
+    assert_eq!(node.cached_bundles(), 1);
+    // The same ref pointing somewhere else is a different bundle.
+    git(&work, &["checkout", "-q", "main"]);
+    std::fs::write(work.join("more.txt"), "more").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "more"]);
+    git(&work, &["push", "-q", tmp.path().join("repos/public/demo.git").to_str().unwrap(), "main"]);
+    assert_ne!(node.handle("/git/fetch", &ask, Some(ME)).unwrap(), first);
+    assert_eq!(node.cached_bundles(), 2);
+    // A peer who may not read it gets nothing from the cache.
+    let (_tmp, closed, _) = self::node("");
+    assert_eq!(text(&closed.handle("/git/fetch", &ask, Some(ME)).unwrap()).0, 3);
+}
+
+#[test]
+fn big_requests_and_big_bundles_are_refused() {
+    let (_tmp, mut node, _) = node("r:all");
+    let long = rmpv_request("public/demo.git", &[("pad", rmpv::Value::from("x".repeat(2 * 1024 * 1024)))]);
+    assert_eq!(text(&node.handle("/git/list", &long, Some(ME)).unwrap()), (2, "Request is too large".into()));
+    node.max_bundle_bytes = 100;
+    let ask = fetch_of(&["refs/heads/main"]);
+    assert_eq!(text(&node.handle("/git/fetch", &ask, Some(ME)).unwrap()), (0xff, "Bundle is too large".into()));
+}
+
+#[test]
+fn building_stops_when_told_to() {
+    let (_tmp, _node, _) = node("r:all");
+    let repo = gix::open(_tmp.path().join("repos/public/demo.git")).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(true);
+    assert!(rngit::bundle::build_many_until(&repo, &[("refs/heads/main", None)], &[], &stop).is_err());
+    let go = std::sync::atomic::AtomicBool::new(false);
+    assert!(rngit::bundle::build_many_until(&repo, &[("refs/heads/main", None)], &[], &go).is_ok());
+}

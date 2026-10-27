@@ -53,7 +53,13 @@ pub async fn serve(
             .handle
             .register_request_handler(path, AllowPolicy::AllowAll, Vec::new(), false, move |request| {
                 let peer = request.remote_identity.as_ref().map(|identity| identity.hash);
-                let Some(response) = node.handle(&request.path, &request.data, peer) else { return RequestOutcome::Drop };
+                let answered = || node.handle(&request.path, &request.data, peer);
+                // Building a bundle takes a while: let the runtime's other threads carry on meanwhile.
+                let response = match tokio::runtime::Handle::try_current() {
+                    Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(answered),
+                    _ => answered(),
+                };
+                let Some(response) = response else { return RequestOutcome::Drop };
                 if let Some(activity) = &activity {
                     activity(
                         &request.path,

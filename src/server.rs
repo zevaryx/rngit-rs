@@ -13,6 +13,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use rmpv::Value;
@@ -29,6 +32,8 @@ pub const NULL_IDENT: [u8; 16] = [0xd7, 0xdb, 0x22, 0xf6, 0x3b, 0x45, 0x3c, 0x23
 const MAX_REFS: usize = 10_000;
 /// Most hashes a client may say it already holds.
 const MAX_HAVES: usize = 1024;
+/// Largest request body read.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Largest `.allowed` file read.
 const MAX_RULES_BYTES: u64 = 64 * 1024;
 
@@ -130,6 +135,42 @@ pub struct Node {
     pub blocked: HashSet<[u8; 16]>,
     /// Largest bundle sent in one reply.
     pub max_bundle_bytes: usize,
+    /// How long building one bundle may take.
+    pub max_request_time: Duration,
+    /// Bundles built lately, so a second clone of the same thing costs nothing.
+    cache: Arc<Mutex<BundleCache>>,
+}
+
+/// How long a bundle is kept, and how much of them in all.
+const CACHE_TTL: Duration = Duration::from_secs(600);
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a bundle was built from: the repository, and for each ref wanted its
+/// object, what the receiver holds of it, and the other tips it holds.
+type CacheKey = (PathBuf, Vec<(String, ObjectId, Option<ObjectId>)>, Vec<ObjectId>);
+
+#[derive(Debug, Default)]
+struct BundleCache {
+    entries: Vec<(CacheKey, Instant, Arc<Vec<u8>>)>,
+}
+
+impl BundleCache {
+    fn get(&mut self, key: &CacheKey) -> Option<Arc<Vec<u8>>> {
+        self.entries.retain(|(_, at, _)| at.elapsed() < CACHE_TTL);
+        self.entries.iter().find(|(k, ..)| k == key).map(|(_, _, data)| data.clone())
+    }
+
+    /// Keep `data`, dropping the oldest bundles to stay within [`CACHE_BYTES`].
+    /// A bundle too big for that on its own isn't kept.
+    fn put(&mut self, key: CacheKey, data: Arc<Vec<u8>>) {
+        if data.len() > CACHE_BYTES / 2 {
+            return;
+        }
+        self.entries.push((key, Instant::now(), data));
+        while self.entries.iter().map(|(_, _, d)| d.len()).sum::<usize>() > CACHE_BYTES {
+            self.entries.remove(0);
+        }
+    }
 }
 
 /// A request that can't be answered as asked.
@@ -144,8 +185,13 @@ impl Refusal {
 }
 
 impl Node {
+    /// How many built bundles are being kept.
+    pub fn cached_bundles(&self) -> usize {
+        self.cache.lock().map_or(0, |cache| cache.entries.len())
+    }
+
     pub fn new(root: PathBuf) -> Self {
-        Node { root, max_bundle_bytes: 256 * 1024 * 1024, ..Node::default() }
+        Node { root, max_bundle_bytes: 256 * 1024 * 1024, max_request_time: Duration::from_secs(120), ..Node::default() }
     }
 
     /// Answer one request. `peer` is the identity hash the sender proved on
@@ -172,6 +218,9 @@ impl Node {
         let result = (|| {
             if self.blocked.contains(&peer) {
                 return Err(Refusal(Status::NotAllowed, "Not allowed"));
+            }
+            if data.len() > MAX_REQUEST_BYTES {
+                return Err(Refusal(Status::BadRequest, "Request is too large"));
             }
             let request = wire::decode(data).map_err(|_| Refusal(Status::BadRequest, "Invalid request"))?;
             let map = MapRef::new(&request).map_err(|_| Refusal(Status::BadRequest, "Invalid request"))?;
@@ -245,19 +294,55 @@ impl Node {
         let others: Vec<ObjectId> =
             map.array("have").iter().take(MAX_HAVES).filter_map(|v| ObjectId::from_hex(v.as_str()?.as_bytes()).ok()).collect();
         let wants: Vec<(&str, Option<ObjectId>)> = names.iter().map(|(n, h)| (n.as_str(), *h)).collect();
-        for (name, _) in &wants {
-            if repo.find_reference(*name).is_err() {
-                return Err(Refusal(Status::NotFound, "Not found"));
-            }
+        let mut key_refs = Vec::new();
+        for (name, have) in &wants {
+            let id = bundle::direct_id(&repo, name).map_err(|_| Refusal(Status::NotFound, "Not found"))?;
+            key_refs.push((name.to_string(), id, *have));
         }
-        let data = bundle::build_many(&repo, &wants, &others).map_err(|_| Refusal(Status::ServerError, "Could not build bundle"))?;
+        let key: CacheKey = (repo.git_dir().to_path_buf(), key_refs, others.clone());
+        let cached = self.cache.lock().ok().and_then(|mut cache| cache.get(&key));
+        let data = match cached {
+            Some(data) => data,
+            None => {
+                let data = Arc::new(self.build_in_time(&repo, &wants, &others)?);
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.put(key, data.clone());
+                }
+                data
+            }
+        };
         if data.len() > self.max_bundle_bytes {
             return Err(Refusal(Status::ServerError, "Bundle is too large"));
         }
+        let data = data.as_ref().clone();
         let mut metadata = Vec::new();
         rmpv::encode::write_value(&mut metadata, &Value::Map(vec![(Value::from(1), Value::from(0))]))
             .map_err(|_| Refusal(Status::ServerError, "Could not build bundle"))?;
         Ok(Response::File { data, metadata: Some(metadata) })
+    }
+}
+
+impl Node {
+    /// Build a bundle, giving up once [`Node::max_request_time`] has passed.
+    fn build_in_time(&self, repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], others: &[ObjectId]) -> Result<Vec<u8>, Refusal> {
+        let (stop, done) = std::sync::mpsc::channel::<()>();
+        let interrupt = AtomicBool::new(false);
+        let (limit, flag) = (self.max_request_time, &interrupt);
+        let built = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if done.recv_timeout(limit).is_err() {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            });
+            let built = bundle::build_many_until(repo, wants, others, flag);
+            let _ = stop.send(());
+            built
+        });
+        match built {
+            Ok(data) => Ok(data),
+            Err(_) if interrupt.load(Ordering::Relaxed) => Err(Refusal(Status::ServerError, "Took too long")),
+            Err(_) => Err(Refusal(Status::ServerError, "Could not build bundle")),
+        }
     }
 }
 
