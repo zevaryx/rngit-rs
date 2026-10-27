@@ -134,8 +134,8 @@ async fn release_create_follows_the_three_phases_and_signs_everything() {
         let Some(Value::Binary(data)) = field(r, "artifact_data") else { panic!() };
         uploaded.push((field(r, "artifact_name").unwrap().as_str().unwrap().to_string(), data.clone()));
     }
-    assert_eq!(uploaded[0].0, "manifest.rsm");
-    let manifest = sign::verify_release_files(&uploaded[0].1, &uploaded[1..]).unwrap();
+    assert_eq!(uploaded.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["a.bin", "a.bin.rsg", "b.bin", "b.bin.rsg", "manifest.rsm"]);
+    let manifest = sign::verify_release_files(&uploaded[4].1, &uploaded[..4]).unwrap();
     assert_eq!(manifest.version, "v1.0.0");
     assert_eq!(manifest.signer.signer, key.identity_hash());
     assert_eq!(manifest.origin, Some(url().destination));

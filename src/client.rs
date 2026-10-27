@@ -566,11 +566,13 @@ impl<T: Transport> Client<T> {
             },
             now,
         )?;
-        let mut uploads: Vec<(String, Vec<u8>)> = vec![("manifest.rsm".into(), rsm)];
+        // Stock uploads each file and its signature first, and the manifest last.
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         for ((name, data), (_, rsg)) in files.iter().zip(signed) {
-            uploads.push((format!("{name}.rsg"), rsg));
             uploads.push((name.clone(), data.clone()));
+            uploads.push((format!("{name}.rsg"), rsg));
         }
+        uploads.push(("manifest.rsm".into(), rsm));
         for (name, data) in uploads {
             let request = step("artifact").put("artifact_name", name).bin("artifact_data", data);
             self.packet("/mgmt/release", request).await?;

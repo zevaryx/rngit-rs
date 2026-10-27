@@ -71,6 +71,13 @@ fn say(out: &mut dyn Write, line: impl AsRef<str>) -> Result<()> {
     writeln!(out, "{}", line.as_ref()).map_err(Error::git)
 }
 
+/// The commit a tag in the repository around the current folder points at.
+fn commit_of_tag(tag: &str) -> Option<String> {
+    let repo = gix::discover(".").ok()?;
+    let mut reference = repo.find_reference(format!("refs/tags/{tag}").as_str()).ok()?;
+    Some(reference.peel_to_commit().ok()?.id.to_string())
+}
+
 /// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn iso8601(secs: u64) -> String {
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
@@ -175,7 +182,12 @@ pub async fn run<T: Transport>(
                     .ok_or_else(|| Error::InvalidInput(format!("bad file {path:?}")))?;
                 files.push((name.to_string(), std::fs::read(path).map_err(Error::git)?));
             }
-            client.create_release(&repo, signer, tag, None, &notes, &files, &iso8601(now), now).await?;
+            // Like stock, take the commit from the repository in the current folder, if it has the tag.
+            let commit = commit_of_tag(tag);
+            if commit.is_none() {
+                say(out, format!("could not get the commit for tag {tag}; is the tag in the repository in this folder?"))?;
+            }
+            client.create_release(&repo, signer, tag, commit.as_deref(), &notes, &files, &iso8601(now), now).await?;
         }
         "release-delete" => client.delete_release(&repo, arg(1, "TAG")?).await?,
         "work" => {
