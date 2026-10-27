@@ -792,3 +792,160 @@ async fn a_group_is_administered_from_the_file_beside_it() {
     assert!(a.group_perms("nowhere").await.is_err());
     assert!(a.group_perms("../public").await.is_err());
 }
+
+/// Fetches from `source`, a node in this process, as `peer`.
+#[derive(Debug)]
+struct Local {
+    source: Node,
+    peer: [u8; 16],
+}
+
+impl rngit::server::Upstream for Local {
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, _timeout: std::time::Duration) -> Result<(), String> {
+        let client = Client::new(Direct { node: self.source.clone(), peer: Some(self.peer), key: None });
+        // On a thread of its own, as the node's callers are not in an async function.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+                    runtime.block_on(client.clone_into(source, dest)).map(drop).map_err(|e| e.to_string())
+                })
+                .join()
+                .unwrap_or_else(|_| Err("fetching panicked".into()))
+        })
+    }
+}
+
+/// A node that lets anyone make repositories and write, that fetches from `source`.
+fn following(source: &Node) -> (tempfile::TempDir, Node) {
+    let (tmp, mut node) = open_node();
+    node.default_rules = Rule::parse("c:all, r:all");
+    node.upstream = Some(std::sync::Arc::new(Local { source: source.clone(), peer: ME }));
+    (tmp, node)
+}
+
+fn source_url() -> String {
+    url().to_string()
+}
+
+#[tokio::test]
+async fn a_fork_and_a_mirror_follow_their_source() {
+    let (source_tmp, source, _work) = node("r:all");
+    let source_repo = source_tmp.path().join("repos/public/demo.git");
+    let (tmp, node) = following(&source);
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let fork = new_url();
+    let mirror: RepoUrl = "rns://00112233445566778899aabbccddeeff/public/copy".parse().unwrap();
+
+    client.fork(&fork, &source_url()).await.unwrap();
+    client.mirror(&mirror, &source_url()).await.unwrap();
+    let (forked, mirrored) = (tmp.path().join("repos/public/new.git"), tmp.path().join("repos/public/copy.git"));
+    for (dir, kind) in [(&forked, "fork"), (&mirrored, "mirror")] {
+        assert_eq!(git(dir, &["rev-parse", "main"]), git(&source_repo, &["rev-parse", "main"]));
+        assert_eq!(git(dir, &["rev-parse", "topic"]), git(&source_repo, &["rev-parse", "topic"]));
+        assert_eq!(git(dir, &["cat-file", "-t", "v2"]), "tag");
+        git(dir, &["fsck", "--strict"]);
+        // Marked as stock rngit marks them, which git itself reads.
+        assert_eq!(git(dir, &["config", "repository.rngit.type"]), kind);
+        assert_eq!(git(dir, &["config", "repository.rngit.upstream.source"]), source_url());
+        assert!(git(dir, &["config", "repository.rngit.upstream.sync"]).parse::<u64>().unwrap() > 1_000_000_000);
+        // Whoever made it is its administrator.
+        let allowed = std::fs::read_to_string(format!("{}.allowed", dir.display())).unwrap();
+        assert_eq!(allowed, format!("adm:{}", hex::encode(ME)));
+    }
+    assert_eq!(git(&forked, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+
+    // The source moves on: a commit on main, a new tag, and HEAD on another branch.
+    let work = source_tmp.path().join("work2");
+    git(source_tmp.path(), &["clone", "-q", source_repo.to_str().unwrap(), work.to_str().unwrap()]);
+    std::fs::write(work.join("new.txt"), "new").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "newer"]);
+    git(&work, &["tag", "v3"]);
+    git(&work, &["push", "-q", "origin", "main", "v3"]);
+    git(&source_repo, &["symbolic-ref", "HEAD", "refs/heads/topic"]);
+    client.sync(&fork).await.unwrap();
+    client.sync(&mirror).await.unwrap();
+    for dir in [&forked, &mirrored] {
+        assert_eq!(git(dir, &["rev-parse", "main"]), git(&source_repo, &["rev-parse", "main"]));
+        assert_eq!(git(dir, &["cat-file", "-t", "v3"]), "commit");
+        git(dir, &["fsck", "--strict"]);
+    }
+    // A mirror's HEAD follows the source's; a fork's stays where it was.
+    assert_eq!(git(&mirrored, &["symbolic-ref", "HEAD"]), "refs/heads/topic");
+    assert_eq!(git(&forked, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(git(&mirrored, &["config", "repository.rngit.type"]), "mirror");
+}
+
+#[tokio::test]
+async fn mirrors_that_have_not_followed_lately_are_brought_up_to_date() {
+    let (source_tmp, source, _work) = node("r:all");
+    let source_repo = source_tmp.path().join("repos/public/demo.git");
+    let (tmp, node) = following(&source);
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let (mirror, fork) = (new_url(), "rns://00112233445566778899aabbccddeeff/public/forked".parse::<RepoUrl>().unwrap());
+    client.mirror(&mirror, &source_url()).await.unwrap();
+    client.fork(&fork, &source_url()).await.unwrap();
+    git(&source_repo, &["branch", "later", "main"]);
+    // Followed just now: nothing to do.
+    assert_eq!(node.sync_mirrors(std::time::Duration::from_secs(3600)), 0);
+    // Not for a day: the mirror follows, the fork is left alone.
+    let (mirrored, forked) = (tmp.path().join("repos/public/new.git"), tmp.path().join("repos/public/forked.git"));
+    git(&mirrored, &["config", "repository.rngit.upstream.sync", "1000"]);
+    git(&forked, &["config", "repository.rngit.upstream.sync", "1000"]);
+    assert_eq!(node.sync_mirrors(std::time::Duration::from_secs(24 * 3600)), 1);
+    assert!(git(&mirrored, &["branch", "--list", "later"]).contains("later"));
+    assert!(git(&forked, &["branch", "--list", "later"]).is_empty());
+    assert!(git(&mirrored, &["config", "repository.rngit.upstream.sync"]).parse::<u64>().unwrap() > 1_000_000_000);
+}
+
+#[tokio::test]
+async fn forks_and_mirrors_are_refused_what_they_should_be() {
+    let (_source_tmp, source, _work) = node("r:all");
+    let (tmp, node) = following(&source);
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let reply = |result: Result<(), Error>| result.unwrap_err().to_string();
+    // Sources that aren't rns:// ones, and ones that aren't sources.
+    assert!(reply(me.fork(&new_url(), "https://example.com/x.git").await).contains("Prohibited source URL"));
+    assert!(reply(me.fork(&new_url(), "git@example.com:x.git").await).contains("Prohibited source URL"));
+    assert!(reply(me.fork(&new_url(), "rns://nope").await).contains("Invalid source URL"));
+    assert!(reply(me.fork(&new_url(), "").await).contains("No source specified"));
+    // A source that can't be fetched leaves nothing behind.
+    let missing = "rns://00112233445566778899aabbccddeeff/public/missing";
+    assert!(reply(me.fork(&new_url(), missing).await).contains("Failed to fetch from source"));
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("repos/public")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "{left:?}");
+    // Who may make repositories, who has to say who they are, and what is taken.
+    let anonymous = Client::new(Direct { node: node.clone(), peer: None, key: None });
+    assert!(reply(anonymous.fork(&new_url(), &source_url()).await).contains("Not identified"));
+    me.fork(&new_url(), &source_url()).await.unwrap();
+    assert!(reply(me.fork(&new_url(), &source_url()).await).contains("already exists"));
+    let (_t, mut closed) = open_node();
+    closed.default_rules = Rule::parse("r:all");
+    closed.upstream = node.upstream.clone();
+    let reader = Client::new(Direct { node: closed, peer: Some(ME), key: None });
+    assert!(reply(reader.fork(&new_url(), &source_url()).await).to_lowercase().contains("not allowed"));
+    // A node with nothing to fetch with says so.
+    let (_t, mut bare) = open_node();
+    bare.upstream = None;
+    let bare = Client::new(Direct { node: bare, peer: Some(ME), key: None });
+    assert!(reply(bare.fork(&new_url(), &source_url()).await).contains("can't fetch"));
+
+    // Syncing: needs write, and a repository that follows something.
+    let plain: RepoUrl = "rns://00112233445566778899aabbccddeeff/public/plain".parse().unwrap();
+    me.create(&plain).await.unwrap();
+    assert!(reply(me.sync(&plain).await).contains("neither fork nor mirror"));
+    let (_t, writer) = {
+        let (t, mut n) = following(&source);
+        n.default_rules = Rule::parse("c:all, r:all");
+        (t, n)
+    };
+    let stranger = Client::new(Direct { node: writer, peer: Some([9; 16]), key: None });
+    assert!(stranger.sync(&new_url()).await.is_err());
+    assert!(reply(me.sync(&"rns://00112233445566778899aabbccddeeff/public/none".parse().unwrap()).await).contains("Not found"));
+    // Syncing from a source that's gone fails, and the repository stays as it was.
+    let before = git(&tmp.path().join("repos/public/new.git"), &["rev-parse", "main"]);
+    git(&tmp.path().join("repos/public/new.git"), &["config", "repository.rngit.upstream.source", missing]);
+    assert!(reply(me.sync(&new_url()).await).contains("sync failed"));
+    assert_eq!(git(&tmp.path().join("repos/public/new.git"), &["rev-parse", "main"]), before);
+}
