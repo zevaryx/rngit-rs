@@ -23,7 +23,12 @@ pub struct Session {
 
 /// Load `client_identity` from `dir`, making one if it isn't there.
 pub fn load_or_create_identity(dir: &std::path::Path) -> Result<Identity, Error> {
-    let path = dir.join("client_identity");
+    load_identity_named(dir, "client_identity")
+}
+
+/// Load the identity file `name` from `dir`, making one if it isn't there.
+pub fn load_identity_named(dir: &std::path::Path, name: &str) -> Result<Identity, Error> {
+    let path = dir.join(name);
     if path.exists() {
         return Identity::from_file(&path).map_err(|e| Error::Transport(format!("could not read {}: {e}", path.display())));
     }

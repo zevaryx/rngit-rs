@@ -330,6 +330,10 @@ All requests carry `0: repo` and `"operation"`.
 9. ~~Whether `/git/list` with `for_push: true` checks write permission.~~ Answered: yes. On a read-only group it answers `0x03` with the text `Not allowed` (a `0x03` status, not `0x01`), while `for_push: false` works. `/git/delete` and a bundle-less `/git/push` answer `0x01 Not allowed`. Stock and rngit helpers both fail the push at the listing, with the same exit code and requests.
 10. Behaviour when two clients push the same ref at once.
 
+## 6a. Serving (rngit-rs)
+
+`server::Node` implements the read side: `/git/list` and `/git/fetch` as in 3.1 and 3.2. Permission rules are lines like `r:all` or `rw:<32 hex>` separated by new lines or commas, read from `<repo>.git.allowed`, then `group.allowed`, then the node's own settings. A peer with no read permission, or a path that is not `group/name.git` with plain names, gets `0x03 Not found`. A request that names a write operation gets `0x01 Not allowed`. Checked against the stock `git-remote-rns` and ours over a live Reticulum link.
+
 ## 7. Implementation notes
 
 - Needed from rsreticulum: `SINGLE` out destination, announce/path handling, `Link` establish and `identify`, `Link.request` with MessagePack bodies, Resource receive and send (bundles, artifacts), and request responses that are Resources. Check each is available in the pinned rsReticulum revision before starting.

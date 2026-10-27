@@ -48,6 +48,7 @@ Work documents (SCOPE is active, completed, proposed or all):
   work-complete URL ID    work-activate URL ID    work-delete URL ID [SCOPE]
 Network:
   nodes [SECONDS]               listen for rngit nodes (the rngit program handles this)
+  serve DIR [RULES]             host the repositories in DIR (group/name.git); RULES such as r:all apply to every group
 ";
 
 fn scope(arg: Option<&String>) -> Result<WorkScope> {

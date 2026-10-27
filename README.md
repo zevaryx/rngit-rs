@@ -25,6 +25,7 @@ Requires Rust 1.89 or newer (edition 2024).
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
 | Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release`, `set_latest_release` (`release-latest`) |
 | Checking a release offline | `rngit release-get URL TAG manifest.rsm DIR` saves the signed manifest; `rngit verify MANIFEST [DIR]` checks its signature and each file of it found in DIR, with no node |
+| Hosting | `server::Node` answers `/git/list` and `/git/fetch` from a folder of `group/name.git` repositories, with the permissions of `.allowed` files; `serve::serve` puts it on Reticulum as a `git.repositories` node, and `rngit serve DIR [RULES]` runs one. Read-only so far: writes, releases and work documents are answered "not allowed". Stock `git clone` and ours both clone from it |
 | Work documents | `work_list`, `work_create` (create or propose), `work_view`, `work_comment`, `work_edit`, `work_complete`, `work_activate`, `work_delete` |
 | Finding nodes | `discovery::discover` listens for rngit announces |
 
