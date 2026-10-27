@@ -80,6 +80,15 @@ pub(crate) fn valid_ref_name(name: &str) -> bool {
 /// refs the bundle names, each checked to exist in `repo` afterwards.
 pub fn ingest_objects(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(ObjectId, String)>> {
     let header = parse_header(data)?;
+    ingest_objects_with(repo, data, header, &NO_INTERRUPT)
+}
+
+fn ingest_objects_with(
+    repo: &gix::Repository,
+    data: &[u8],
+    header: BundleHeader,
+    interrupt: &AtomicBool,
+) -> Result<Vec<(ObjectId, String)>> {
     for (_, name) in &header.refs {
         if !valid_ref_name(name) {
             return Err(Error::Protocol(format!("bundle names an unsafe ref: {name:?}")));
@@ -97,7 +106,7 @@ pub fn ingest_objects(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(Object
             &mut pack as &mut dyn BufRead,
             Some(&dir),
             &mut progress,
-            &NO_INTERRUPT,
+            interrupt,
             Some(repo.objects.clone()),
             repo.object_hash(),
             Default::default(),
@@ -109,6 +118,99 @@ pub fn ingest_objects(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(Object
         repo.find_object(*id).map_err(|_| Error::Protocol(format!("bundle did not contain {id} for {name}")))?;
     }
     Ok(header.refs)
+}
+
+/// What a pack received may come to, so a small one can't grow into a huge
+/// repository.
+#[derive(Debug, Clone, Copy)]
+pub struct PackLimits {
+    pub max_objects: u32,
+    /// Largest one object may be once unpacked, deltas applied.
+    pub max_object_bytes: u64,
+    /// All objects together, once unpacked.
+    pub max_total_bytes: u64,
+}
+
+/// The size a delta says its result has: the second number at the start of
+/// the delta, after the size of its base.
+fn delta_result_size(compressed: &[u8]) -> Option<u64> {
+    use std::io::Read;
+    let mut head = [0u8; 24];
+    let mut inflate = flate2::read::ZlibDecoder::new(compressed);
+    let mut have = 0;
+    // Both sizes are varints of at most 10 bytes each.
+    while have < head.len() {
+        match inflate.read(&mut head[have..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => have += n,
+        }
+    }
+    let mut pos = 0;
+    let mut varint = || -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = *head[..have].get(pos)?;
+            pos += 1;
+            value |= u64::from(byte & 0x7f).checked_shl(shift)?;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    };
+    varint()?;
+    varint()
+}
+
+/// Read through `pack` and refuse it if it holds too many objects, or any is
+/// too big once unpacked, or all are together. This reads the sizes the
+/// pack declares (a delta's result size is read from the delta), so nothing
+/// is unpacked to find out.
+pub fn check_pack(mut pack: &[u8], hash: gix::hash::Kind, limits: PackLimits) -> Result<()> {
+    use gix_pack::data::input::{BytesToEntriesIter, EntryDataMode, Mode};
+    let too_big = |what: &str| Error::Protocol(format!("pack is too big: {what}"));
+    let reader: &mut dyn BufRead = &mut pack;
+    let entries = BytesToEntriesIter::new_from_header(reader, Mode::AsIs, EntryDataMode::Keep, hash).map_err(Error::git)?;
+    if entries.size_hint().0 as u64 > u64::from(limits.max_objects) {
+        return Err(too_big("too many objects"));
+    }
+    let mut total = 0u64;
+    for (seen, entry) in entries.enumerate() {
+        if seen as u64 >= u64::from(limits.max_objects) {
+            return Err(too_big("too many objects"));
+        }
+        let entry = entry.map_err(Error::git)?;
+        let size = if entry.header.is_delta() {
+            entry
+                .compressed
+                .as_deref()
+                .and_then(delta_result_size)
+                .ok_or_else(|| Error::Protocol("pack has a delta that can't be read".into()))?
+        } else {
+            entry.decompressed_size
+        };
+        if size > limits.max_object_bytes {
+            return Err(too_big("an object is over the limit"));
+        }
+        total = total.saturating_add(size);
+        if total > limits.max_total_bytes {
+            return Err(too_big("everything in it is over the limit"));
+        }
+    }
+    Ok(())
+}
+
+/// [`ingest_objects`], refusing a pack over `limits` first and giving up
+/// soon after `interrupt` is set.
+pub fn ingest_objects_checked(
+    repo: &gix::Repository,
+    data: &[u8],
+    limits: PackLimits,
+    interrupt: &AtomicBool,
+) -> Result<Vec<(ObjectId, String)>> {
+    let header = parse_header(data)?;
+    check_pack(&data[header.pack_offset..], repo.object_hash(), limits)?;
+    ingest_objects_with(repo, data, header, interrupt)
 }
 
 /// Write the bundle's pack into `repo` and point its refs at the new tips.
