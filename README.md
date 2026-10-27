@@ -23,7 +23,8 @@ Requires Rust 1.89 or newer (edition 2024).
 | Reading a copy | `local::log`, `local::tree`, `local::file` (`rngit log`, `tree`, `show` DIR REF): history, the files of a branch or tag, one file's text, from a repository on this computer such as the one `mirror_into` keeps |
 | Repositories | `create`, `fork`, `mirror`, `sync` |
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
-| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release` |
+| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release`, `set_latest_release` (`release-latest`) |
+| Checking a release offline | `rngit release-get URL TAG manifest.rsm DIR` saves the signed manifest; `rngit verify MANIFEST [DIR]` checks its signature and each file of it found in DIR, with no node |
 | Work documents | `work_list`, `work_create` (create or propose), `work_view`, `work_comment`, `work_edit`, `work_complete`, `work_activate`, `work_delete` |
 | Finding nodes | `discovery::discover` listens for rngit announces |
 

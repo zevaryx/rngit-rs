@@ -594,6 +594,13 @@ impl<T: Transport> Client<T> {
         self.packet("/mgmt/release", Self::release_request(repo, "delete").put("tag", tag)).await.map(drop)
     }
 
+    /// Make `tag` the release the node calls the latest. The release has to
+    /// exist; the node answers `0x03` if it doesn't.
+    pub async fn set_latest_release(&self, repo: &RepoUrl, tag: &str) -> Result<()> {
+        check_artifact_name(tag)?;
+        self.packet("/mgmt/release", Self::release_request(repo, "latest").put("tag", tag)).await.map(drop)
+    }
+
     /// Publish a release: the tag must already be pushed. Signs each file,
     /// builds the manifest, uploads everything and finalizes. `released` is
     /// the ISO 8601 time shown in the manifest and `now` is a Unix time.

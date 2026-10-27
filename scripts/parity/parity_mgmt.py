@@ -10,7 +10,7 @@ reads or writes in one call each, so that step compares the "set" request only.
 Stock opens $EDITOR for every text; this script points it at editor.sh, which
 writes $EDIT_TEXT.
 """
-import importlib.util, json, os, re, shutil, subprocess, sys, tempfile
+import glob, importlib.util, json, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("parity", os.path.join(HERE, "parity.py"))
@@ -55,7 +55,9 @@ class Run:
         """Run one step. `only` lists the request paths worth comparing, when the two flows differ on purpose."""
         self.e.env["EDIT_TEXT"] = text or ""
         args = (stock_args if self.helper == "stock" else ours_args)
-        argv = self.build(self.e, *[a.replace("@URL", self.url).replace("@NAME", self.name) for a in args])
+        found = glob.glob(os.path.join(cwd or ".", "*.rsm"))  # the manifest a fetch left in the folder
+        manifest = sorted(found)[0] if found else "missing.rsm"
+        argv = self.build(self.e, *[a.replace("@URL", self.url).replace("@NAME", self.name).replace("@MANIFEST", manifest) for a in args])
         if confirm and self.helper == "stock":  # stock asks "Are you sure?" before a delete; ours doesn't
             argv = ["sh", "-c", 'printf "y\\n" | exec "$@"', "sh", *argv]
         p = self.e.sh(step, argv, cwd=cwd)
@@ -117,6 +119,14 @@ def scenario(helper, tag):
     os.makedirs(dl)
     r.cmd("release-fetch", ["release", "@URL", "fetch", "v1:app.bin"], ["release-get", "@URL", "v1", "app.bin", dl], cwd=dl)
     r.cmd("release-view-missing", ["release", "@URL", "view", "v9"], ["release", "@URL", "v9"])
+    r.cmd("release-latest", ["release", "@URL", "latest", "v1"], ["release-latest", "@URL", "v1"], confirm=True)
+    r.cmd("release-latest-missing", ["release", "@URL", "latest", "v9"], ["release-latest", "@URL", "v9"], confirm=True)
+    # Offline: stock leaves its manifest in the folder it fetched into; ours is asked for it.
+    r.cmd("release-manifest", ["release", "@URL", "view", "v1"], ["release-get", "@URL", "v1", "manifest.rsm", dl], only=["/none"])
+    r.cmd("release-verify-offline", ["release", "@MANIFEST", "verify"], ["verify", "@MANIFEST"], cwd=dl)
+    open(dl + "/app.bin", "ab").write(b"tampered")
+    r.cmd("release-verify-tampered", ["release", "@MANIFEST", "verify"], ["verify", "@MANIFEST"], cwd=dl)
+    open(dl + "/app.bin", "wb").write(b"artifact\n" * 50)
     r.cmd("release-delete", ["release", "@URL", "delete", "v1"], ["release-delete", "@URL", "v1"], confirm=True)
 
     # Fork and sync
@@ -124,6 +134,9 @@ def scenario(helper, tag):
     r.cmd("fork", ["fork", "@URL", fork], ["fork", fork, "@URL"])
     r.cmd("sync", ["sync", fork], ["sync", fork])
     r.cmd("sync-plain-repo", ["sync", "@URL"], ["sync", "@URL"])
+    mirror = "rns://%s/public/@NAME_mirror.git" % D
+    r.cmd("mirror", ["mirror", "@URL", mirror], ["mirror", mirror, "@URL"])
+    r.cmd("sync-mirror", ["sync", mirror], ["sync", mirror])
     return r.e.log, dict(files=r.state())
 
 

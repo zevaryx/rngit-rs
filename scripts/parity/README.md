@@ -48,4 +48,5 @@ the files it ended up with. Besides the lab above:
 
 Run `python3 -I parity_mgmt.py TAG`. Some flows differ on purpose: stock's `perms` always reads and
 then writes through an editor, and `work edit` views the document first, so those steps compare only
-the write request. Stock asks before a delete, so the script answers `y`.
+the write request. Stock asks before a delete, so the script answers `y`. The script also covers
+`release latest`, the saved manifest with offline `verify`, and `mirror` with `sync`.
