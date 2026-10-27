@@ -57,6 +57,27 @@ pub struct FileView {
     pub truncated: bool,
 }
 
+/// The branches and tags of a copy, and the branch its HEAD is on, as the node listed them.
+pub fn refs(dir: &Path) -> Result<crate::client::RemoteRefs> {
+    let repo = gix::open(dir).map_err(Error::git)?;
+    let mut out = crate::client::RemoteRefs::default();
+    let platform = repo.references().map_err(Error::git)?;
+    for prefix in ["refs/heads/", "refs/tags/"] {
+        for reference in platform.prefixed(prefix).map_err(Error::git)?.flatten() {
+            if out.refs.len() >= MAX_ENTRIES {
+                return Err(Error::TooLarge { what: "ref list", size: out.refs.len() + 1, limit: MAX_ENTRIES });
+            }
+            let name = reference.name().as_bstr().to_string();
+            out.refs.push((crate::bundle::direct_id(&repo, &name)?, name));
+        }
+    }
+    out.head = repo.find_reference("HEAD").ok().and_then(|head| match head.target() {
+        gix::refs::TargetRef::Symbolic(name) => Some(name.as_bstr().to_string()),
+        gix::refs::TargetRef::Object(_) => None,
+    });
+    Ok(out)
+}
+
 fn commit_of<'r>(repo: &'r gix::Repository, refname: &str) -> Result<gix::Commit<'r>> {
     if !refname.starts_with("refs/") {
         return Err(Error::InvalidInput(format!("{refname:?} is not a full ref name")));

@@ -118,3 +118,17 @@ async fn a_mirrored_repository_can_be_read_offline() {
     assert_eq!(log.len(), 3);
     assert_eq!(local::tree(&dest, "refs/heads/main", "").unwrap().len(), 3);
 }
+
+#[test]
+fn the_refs_of_a_copy_are_listed_with_its_head() {
+    let (_tmp, copy) = copy();
+    let refs = local::refs(&copy).unwrap();
+    let mut names: Vec<&str> = refs.refs.iter().map(|(_, n)| n.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["refs/heads/main", "refs/heads/topic", "refs/tags/v1", "refs/tags/v2"]);
+    assert_eq!(refs.get("refs/heads/topic").unwrap().to_string(), git(&copy, &["rev-parse", "topic"]));
+    // The annotated tag is listed as its tag object, as a node does.
+    assert_eq!(git(&copy, &["cat-file", "-t", &refs.get("refs/tags/v2").unwrap().to_string()]), "tag");
+    assert_eq!(refs.head.as_deref(), Some("refs/heads/main"));
+    assert!(local::refs(&copy.join("nowhere")).is_err());
+}
