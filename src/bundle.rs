@@ -215,21 +215,42 @@ pub fn direct_id(repo: &gix::Repository, name: &str) -> Result<ObjectId> {
 /// and listed as a prerequisite, when `have` is an object we hold. An
 /// annotated tag travels as the tag object, so the node keeps it.
 pub fn build(repo: &gix::Repository, refname: &str, have: Option<ObjectId>) -> Result<Vec<u8>> {
-    let direct = direct_id(repo, refname)?;
+    build_many(repo, &[(refname, have)], &[])
+}
+
+/// Build one v2 bundle of several refs. For each ref, `have` is what the
+/// receiver holds of it, and `others` are further tips it holds. Anything
+/// reachable from those that we hold ourselves is left out and listed as a
+/// prerequisite.
+pub fn build_many(repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], others: &[ObjectId]) -> Result<Vec<u8>> {
     let mut tags = Vec::new();
-    let mut tip = direct;
-    loop {
-        let object = repo.find_object(tip).map_err(Error::git)?;
-        if object.kind != gix::object::Kind::Tag {
-            break;
+    let mut tips = Vec::new();
+    let mut heads = Vec::new();
+    for (refname, _) in wants {
+        let direct = direct_id(repo, refname)?;
+        let mut tip = direct;
+        loop {
+            let object = repo.find_object(tip).map_err(Error::git)?;
+            if object.kind != gix::object::Kind::Tag {
+                break;
+            }
+            tags.push(tip);
+            tip = object.into_tag().target_id().map_err(Error::git)?.detach();
         }
-        tags.push(tip);
-        tip = object.into_tag().target_id().map_err(Error::git)?.detach();
+        tips.push(tip);
+        heads.push((direct, *refname));
     }
-    let have = have.filter(|h| repo.find_object(*h).is_ok());
-    let mut walk = repo.rev_walk([tip]);
-    if let Some(h) = have {
-        walk = walk.with_hidden([h]);
+    let mut haves: Vec<ObjectId> = Vec::new();
+    for have in wants.iter().filter_map(|(_, h)| *h).chain(others.iter().copied()) {
+        // Only commits can be left out, and only ones we hold.
+        let commit = repo.find_object(have).ok().filter(|o| o.kind == gix::object::Kind::Commit);
+        if commit.is_some() && !haves.contains(&have) {
+            haves.push(have);
+        }
+    }
+    let mut walk = repo.rev_walk(tips);
+    if !haves.is_empty() {
+        walk = walk.with_hidden(haves.clone());
     }
     let mut ids: Vec<ObjectId> =
         walk.all().map_err(Error::git)?.map(|i| i.map(|i| i.id)).collect::<std::result::Result<_, _>>().map_err(Error::git)?;
@@ -259,10 +280,13 @@ pub fn build(repo: &gix::Repository, refname: &str, have: Option<ObjectId>) -> R
     .map_err(Error::git)?;
     let mut out = Vec::new();
     writeln!(out, "# v2 git bundle").map_err(Error::git)?;
-    if let Some(h) = have {
+    for h in &haves {
         writeln!(out, "-{h} prerequisite").map_err(Error::git)?;
     }
-    writeln!(out, "{direct} {refname}\n").map_err(Error::git)?;
+    for (direct, refname) in &heads {
+        writeln!(out, "{direct} {refname}").map_err(Error::git)?;
+    }
+    writeln!(out).map_err(Error::git)?;
     let writer = output::bytes::FromEntriesIter::new(
         entries.map(|r| r.map(|(_, e)| e)),
         &mut out,

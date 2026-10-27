@@ -15,6 +15,9 @@ pub mod local;
 #[cfg(feature = "reticulum")]
 pub mod rns;
 #[cfg(feature = "reticulum")]
+pub mod serve;
+pub mod server;
+#[cfg(feature = "reticulum")]
 pub mod session;
 pub mod sign;
 pub mod transport;

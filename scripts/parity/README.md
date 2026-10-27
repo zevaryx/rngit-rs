@@ -34,6 +34,12 @@ resulting repositories are identical, so `parity.py` ignores that list's content
 Also checked by hand with the same two helpers, on a group with only `r:all`: clone works, and a
 push and a branch delete are both refused at the listing, with the same requests and exit code.
 
+## Serving
+
+`rngit serve DIR r:all` hosts the repositories in `DIR` (`group/name.git`) from a client Reticulum
+config. Clone from it with the stock `git-remote-rns` (use the `.git` suffix in the URL, as stock
+sends the path as typed) and with ours.
+
 ## Management calls
 
 `parity_mgmt.py` runs create, permissions, work documents, releases, fork and sync through the stock
