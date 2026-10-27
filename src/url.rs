@@ -23,16 +23,27 @@ fn valid_part(part: &str) -> bool {
 
 impl RepoUrl {
     pub fn new(destination: [u8; 16], group: &str, repo: &str) -> Result<Self, Error> {
-        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        // A repository whose folder is called `.git` has no name left to strip it from.
+        let repo = match repo.strip_suffix(".git") {
+            // `.git.git` would name the same folder as `.git`, so it is refused.
+            Some(".git") => return Err(Error::InvalidInput(format!("bad repository name {group}/{repo}"))),
+            Some(name) if !name.is_empty() => name,
+            _ => repo,
+        };
         if !valid_part(group) || !valid_part(repo) {
             return Err(Error::InvalidInput(format!("bad repository name {group}/{repo}")));
         }
         Ok(RepoUrl { destination, group: group.to_string(), repo: repo.to_string() })
     }
 
+    /// The repository's folder on the node, `repo.git` (or `.git` for a repository called that).
+    pub fn dir_name(&self) -> String {
+        if self.repo == ".git" { self.repo.clone() } else { format!("{}.git", self.repo) }
+    }
+
     /// The repository path as the node expects it, `group/repo.git`.
     pub fn repo_path(&self) -> String {
-        format!("{}/{}.git", self.group, self.repo)
+        format!("{}/{}", self.group, self.dir_name())
     }
 }
 
@@ -76,6 +87,16 @@ mod tests {
     fn accepts_git_suffix() {
         let url: RepoUrl = format!("rns://{HASH}/public/demo.git").parse().unwrap();
         assert_eq!(url.repo, "demo");
+    }
+
+    #[test]
+    fn a_repository_called_dot_git_is_kept_as_it_is() {
+        let url: RepoUrl = format!("rns://{HASH}/BASH_BLOG/.git").parse().unwrap();
+        assert_eq!((url.group.as_str(), url.repo.as_str()), ("BASH_BLOG", ".git"));
+        assert_eq!(url.repo_path(), "BASH_BLOG/.git");
+        assert_eq!(url.dir_name(), ".git");
+        assert_eq!(url.to_string().parse::<RepoUrl>().unwrap(), url);
+        assert!(format!("rns://{HASH}/BASH_BLOG/.git.git").parse::<RepoUrl>().is_err());
     }
 
     #[test]

@@ -517,3 +517,17 @@ async fn a_failed_mirror_leaves_an_existing_copy_as_it_was() {
     assert_eq!(remote_sha(&dest, "main"), before);
     git(&dest, &["fsck", "--strict"]);
 }
+
+#[tokio::test]
+async fn a_repository_called_dot_git_is_asked_for_by_that_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = tmp.path().join("server.git");
+    bare_repo(&server);
+    let client = Client::new(MockNode::new(server));
+    let dotted: RepoUrl = "rns://727ca184e3d7e83e0e35146940920442/BASH_BLOG/.git".parse().unwrap();
+    let _ = client.list(&dotted, false).await;
+    let (path, request) = client.transport().requests().remove(0);
+    assert_eq!(path, "/git/list");
+    let asked = request.as_map().unwrap().iter().find(|(k, _)| k.as_u64() == Some(0)).and_then(|(_, v)| v.as_str());
+    assert_eq!(asked, Some("BASH_BLOG/.git"));
+}

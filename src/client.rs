@@ -565,7 +565,7 @@ impl<T: Transport> Client<T> {
         let rsm = sign::make_rsm(
             signer,
             &ManifestInput {
-                name: &format!("{}.git", repo.repo),
+                name: &repo.dir_name(),
                 version: tag,
                 released,
                 origin,
