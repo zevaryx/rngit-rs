@@ -4,8 +4,8 @@
 //! folder, with no network in it: the caller hands over a request path, its
 //! body and who sent it, and sends back what [`Node::handle`] returns. It
 //! answers `/git/list`, `/git/fetch`, `/git/push`, `/git/create`,
-//! `/git/delete`, `/mgmt/release`, `/mgmt/perms` and `/mgmt/work`. Everything else is answered "not
-//! allowed", as a node would answer a client with no permission.
+//! `/git/delete`, `/git/fork`, `/git/mirror`, `/git/sync`, `/mgmt/release`,
+//! `/mgmt/perms` and `/mgmt/work`.
 //!
 //! The folder holds one folder per group and `name.git` repositories in each.
 //! Who may do what comes from `.allowed` files, see [`Rule`].
@@ -25,10 +25,13 @@ use crate::error::Status;
 use crate::transport::Response;
 use crate::wire::{self, MapRef};
 
+pub use upstream::Upstream;
+
 mod access;
 mod perms;
 mod releases;
 mod support;
+mod upstream;
 mod work;
 
 /// The hash stock rngit gives a peer that didn't identify itself.
@@ -143,6 +146,9 @@ pub struct Node {
     cache: Arc<Mutex<BundleCache>>,
     /// Held while a work document is written, so two never get one number.
     working: Arc<Mutex<()>>,
+    /// What fetches from other nodes, for forks, mirrors and syncs. Without
+    /// one they are refused.
+    pub upstream: Option<Arc<dyn Upstream>>,
 }
 
 /// Who sent a request: the identity hash they proved on their link, and the
@@ -295,6 +301,9 @@ impl Node {
                 "/git/create" => self.create(&request, &peer),
                 "/git/delete" => self.delete_ref(&request, &map, &peer),
                 "/mgmt/release" => self.release(&request, &map, &peer),
+                "/git/fork" => self.fork_or_mirror(&request, &map, &peer, upstream::Kind::Fork),
+                "/git/mirror" => self.fork_or_mirror(&request, &map, &peer, upstream::Kind::Mirror),
+                "/git/sync" => self.sync(&request, &peer),
                 "/mgmt/perms" => self.perms(&request, &map, &peer),
                 "/mgmt/work" => self.work(&request, &map, &peer, key.as_ref()),
                 _ => Err(Refusal::new(Status::NotAllowed, "Not allowed")),

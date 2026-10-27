@@ -5,9 +5,12 @@ use std::sync::Arc;
 use rns_identity::identity::Identity;
 use rns_runtime::prelude::*;
 
+use crate::client::{Client, Limits};
 use crate::error::Error;
-use crate::server::{Node, Sender};
+use crate::rns::RnsTransport;
+use crate::server::{Node, Sender, Upstream};
 use crate::transport::Response;
+use crate::url::RepoUrl;
 
 /// The destination name rngit nodes announce under.
 pub const ASPECT: &str = "git.repositories";
@@ -83,4 +86,54 @@ pub async fn serve(
             .map_err(|e| Error::Transport(format!("could not serve {path}: {e}")))?;
     }
     Ok(registered)
+}
+
+/// Fetches from other nodes over `runtime`, as `identity`, for a [`Node`]'s
+/// forks, mirrors and syncs. Put it in [`Node::upstream`] before the node is
+/// served. It needs the multi-threaded runtime the node's requests are
+/// answered on, since a request waits for the fetch.
+pub fn upstream(runtime: ReticulumHandle, identity: Identity, limits: Limits) -> Arc<dyn Upstream> {
+    Arc::new(Reticulum { runtime, identity, limits })
+}
+
+struct Reticulum {
+    runtime: ReticulumHandle,
+    identity: Identity,
+    limits: Limits,
+}
+
+impl std::fmt::Debug for Reticulum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reticulum")
+    }
+}
+
+impl Upstream for Reticulum {
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| "No runtime to fetch on")?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err("This node can't fetch from other nodes while it runs on one thread".into());
+        }
+        let transport = RnsTransport::new(self.runtime.clone(), self.identity.clone(), source.destination).with_request_timeout(timeout);
+        let client = Client::new(transport).with_limits(self.limits.clone());
+        let fetched = tokio::task::block_in_place(|| handle.block_on(tokio::time::timeout(timeout, client.clone_into(source, dest))));
+        match fetched {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("The source took too long".into()),
+        }
+    }
+}
+
+/// Follow the sources of the node's mirrors: every `check_every`, those that
+/// haven't been brought up to date for `older_than` are. Stop it by aborting
+/// the task.
+pub fn keep_mirrors(node: Arc<Node>, check_every: std::time::Duration, older_than: std::time::Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(check_every).await;
+            let node = node.clone();
+            let _ = tokio::task::spawn_blocking(move || node.sync_mirrors(older_than)).await;
+        }
+    })
 }

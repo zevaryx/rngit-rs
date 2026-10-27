@@ -68,7 +68,11 @@ async fn serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let log: rngit::serve::Activity = std::sync::Arc::new(|path, peer, status| {
         eprintln!("{path} from {} -> {status}", peer.map_or("an unidentified peer".to_string(), hex::encode));
     });
-    let registered = rngit::serve::serve(&session.runtime, identity, std::sync::Arc::new(node), None, Some(log)).await?;
+    node.upstream = Some(rngit::serve::upstream(session.runtime.clone(), identity.clone(), rngit::client::Limits::default()));
+    let node = std::sync::Arc::new(node);
+    // Mirrors follow their sources once a day.
+    rngit::serve::keep_mirrors(node.clone(), Duration::from_secs(3600), Duration::from_secs(24 * 3600));
+    let registered = rngit::serve::serve(&session.runtime, identity, node, None, Some(log)).await?;
     println!("serving rns://{}", hex::encode(registered.handle.destination_hash()));
     // Stock waits a few seconds so the interfaces are up before the first announce.
     tokio::time::sleep(Duration::from_secs(5)).await;
