@@ -704,6 +704,8 @@ impl<T: Transport> Client<T> {
             WorkKind::Create => "create",
             WorkKind::Propose => "propose",
         };
+        // The node strips the text and checks the signature over what is left.
+        let content = content.trim();
         let signature = signer.sign(content.as_bytes())?;
         let request = Self::work_request(repo, operation)
             .put("title", title)

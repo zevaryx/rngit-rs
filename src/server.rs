@@ -4,7 +4,7 @@
 //! folder, with no network in it: the caller hands over a request path, its
 //! body and who sent it, and sends back what [`Node::handle`] returns. It
 //! answers `/git/list`, `/git/fetch`, `/git/push`, `/git/create`,
-//! `/git/delete` and `/mgmt/release`. Everything else is answered "not
+//! `/git/delete`, `/mgmt/release`, `/mgmt/perms` and `/mgmt/work`. Everything else is answered "not
 //! allowed", as a node would answer a client with no permission.
 //!
 //! The folder holds one folder per group and `name.git` repositories in each.
@@ -25,7 +25,11 @@ use crate::error::Status;
 use crate::transport::Response;
 use crate::wire::{self, MapRef};
 
+mod access;
+mod perms;
 mod releases;
+mod support;
+mod work;
 
 /// The hash stock rngit gives a peer that didn't identify itself.
 pub const NULL_IDENT: [u8; 16] = [0xd7, 0xdb, 0x22, 0xf6, 0x3b, 0x45, 0x3c, 0x23, 0xbb, 0x06, 0x88, 0xdd, 0xe5, 0x65, 0xb7, 0xc1];
@@ -41,7 +45,7 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Largest `.allowed` file read.
 const MAX_RULES_BYTES: u64 = 64 * 1024;
 
-/// What an identity may do. `adm` includes all of them.
+/// What an identity may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Perm {
     Read,
@@ -57,15 +61,15 @@ pub enum Perm {
 impl Perm {
     fn from_word(word: &str) -> Option<Vec<Perm>> {
         Some(match word {
-            "r" => vec![Perm::Read],
-            "w" => vec![Perm::Write],
-            "rw" => vec![Perm::Read, Perm::Write],
-            "c" => vec![Perm::Create],
-            "s" => vec![Perm::Stats],
-            "rel" => vec![Perm::Release],
-            "i" => vec![Perm::Issues],
-            "p" => vec![Perm::Proposals],
-            "adm" => vec![Perm::Admin],
+            "r" | "read" => vec![Perm::Read],
+            "w" | "write" => vec![Perm::Write],
+            "rw" | "readwrite" => vec![Perm::Read, Perm::Write],
+            "c" | "create" => vec![Perm::Create],
+            "s" | "stats" => vec![Perm::Stats],
+            "rel" | "release" => vec![Perm::Release],
+            "i" | "interact" => vec![Perm::Issues],
+            "p" | "propose" => vec![Perm::Proposals],
+            "adm" | "admin" => vec![Perm::Admin],
             _ => return None,
         })
     }
@@ -95,29 +99,21 @@ impl Rule {
         for item in text.split(['\n', ',']) {
             let item = item.trim();
             let Some((words, who)) = item.split_once(':') else { continue };
-            let who = match who.trim() {
-                "all" => Who::Everyone,
-                "none" => Who::Nobody,
+            let who = match who.trim().to_ascii_lowercase().as_str() {
+                "all" | "a" | "everyone" => Who::Everyone,
+                "none" | "n" | "nobody" => Who::Nobody,
                 hash => match decode_identity(hash) {
                     Some(id) => Who::Identity(id),
                     None => continue,
                 },
             };
-            let perms: Option<Vec<Perm>> = words.split_whitespace().map(Perm::from_word).collect::<Option<Vec<_>>>().map(|p| p.concat());
+            let perms: Option<Vec<Perm>> =
+                words.split_whitespace().map(|w| Perm::from_word(&w.to_ascii_lowercase())).collect::<Option<Vec<_>>>().map(|p| p.concat());
             if let Some(perms) = perms.filter(|p| !p.is_empty()) {
                 rules.push(Rule { perms, who });
             }
         }
         rules
-    }
-
-    fn gives(&self, who: &[u8; 16], perm: Perm) -> bool {
-        let for_them = match self.who {
-            Who::Everyone => true,
-            Who::Nobody => false,
-            Who::Identity(id) => &id == who,
-        };
-        for_them && (self.perms.contains(&perm) || self.perms.contains(&Perm::Admin))
     }
 }
 
@@ -145,6 +141,17 @@ pub struct Node {
     pub quotas: Quotas,
     /// Bundles built lately, so a second clone of the same thing costs nothing.
     cache: Arc<Mutex<BundleCache>>,
+    /// Held while a work document is written, so two never get one number.
+    working: Arc<Mutex<()>>,
+}
+
+/// Who sent a request: the identity hash they proved on their link, and the
+/// public key of that identity if whatever carries the request knows it
+/// (what a work document is signed with is checked against it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sender {
+    pub hash: [u8; 16],
+    pub key: Option<[u8; 64]>,
 }
 
 /// What writing to the node may add, so one peer can't fill the disk.
@@ -240,6 +247,12 @@ impl Node {
     /// Answer one request. `peer` is the identity hash the sender proved on
     /// its link, if it did. `None` means the path isn't one this node serves.
     pub fn handle(&self, path: &str, data: &[u8], peer: Option<[u8; 16]>) -> Option<Response> {
+        self.handle_from(path, data, peer.map(|hash| Sender { hash, key: None }))
+    }
+
+    /// Like [`Node::handle`], for a sender whose public key is known: work
+    /// documents can't be written without it, as they carry signatures.
+    pub fn handle_from(&self, path: &str, data: &[u8], sender: Option<Sender>) -> Option<Response> {
         let known = matches!(
             path,
             "/git/list"
@@ -257,7 +270,8 @@ impl Node {
         if !known {
             return None;
         }
-        let peer = peer.unwrap_or(NULL_IDENT);
+        let peer = sender.map_or(NULL_IDENT, |s| s.hash);
+        let key = sender.and_then(|s| s.key);
         let result = (|| {
             if self.blocked.contains(&peer) {
                 return Err(Refusal::new(Status::NotAllowed, "Not allowed"));
@@ -281,6 +295,8 @@ impl Node {
                 "/git/create" => self.create(&request, &peer),
                 "/git/delete" => self.delete_ref(&request, &map, &peer),
                 "/mgmt/release" => self.release(&request, &map, &peer),
+                "/mgmt/perms" => self.perms(&request, &map, &peer),
+                "/mgmt/work" => self.work(&request, &map, &peer, key.as_ref()),
                 _ => Err(Refusal::new(Status::NotAllowed, "Not allowed")),
             }
         })();
@@ -316,13 +332,29 @@ impl Node {
         Ok((name, opened))
     }
 
-    /// Whether `peer` holds `perm` for a repository: its own rules first, then
-    /// the group's file, then the node's settings.
+    /// The rules of a group: the files beside it and in it, then the node's
+    /// own settings.
+    fn group_grants(&self, group: &str) -> access::Grants {
+        let mut rules = read_rules(&self.root.join(format!("{group}.allowed")));
+        rules.extend(read_rules(&self.root.join(group).join("group.allowed")));
+        rules.extend(self.group_rules.get(group).into_iter().flatten().cloned());
+        rules.extend(self.default_rules.iter().cloned());
+        access::Grants::from_rules(&rules)
+    }
+
+    fn repo_grants(&self, group: &str, repo: &str) -> access::Grants {
+        access::Grants::from_rules(&read_rules(&self.root.join(group).join(format!("{repo}.allowed"))))
+    }
+
+    /// Whether `peer` holds `perm` for a repository, as stock rngit resolves
+    /// it (see [`access`]): the repository's own rules, then the group's.
     pub fn allowed(&self, group: &str, repo: &str, peer: &[u8; 16], perm: Perm) -> bool {
-        let repo_rules = read_rules(&self.root.join(group).join(format!("{repo}.allowed")));
-        let group_rules = read_rules(&self.root.join(group).join("group.allowed"));
-        let node_rules = self.group_rules.get(group).map_or(&[][..], Vec::as_slice);
-        [repo_rules, group_rules, node_rules.to_vec(), self.default_rules.clone()].iter().flatten().any(|rule| rule.gives(peer, perm))
+        access::repository(peer, perm, &self.repo_grants(group, repo), &self.group_grants(group))
+    }
+
+    /// Whether `peer` holds `perm` for a group.
+    pub fn allowed_in_group(&self, group: &str, peer: &[u8; 16], perm: Perm) -> bool {
+        access::in_group(peer, perm, &self.group_grants(group))
     }
 
     fn list(&self, request: &Value, map: &MapRef, peer: &[u8; 16]) -> Result<Response, Refusal> {
@@ -506,9 +538,7 @@ impl Node {
         let name = int_key(request, 0).ok_or(Refusal::new(Status::BadRequest, "No repository specified"))?;
         let (group, repo) = split_repo_path(&name).ok_or(Refusal::new(Status::BadRequest, "Invalid repository name"))?;
         let group_dir = self.root.join(group);
-        let group_rules = read_rules(&group_dir.join("group.allowed"));
-        let node_rules = self.group_rules.get(group).map_or(&[][..], Vec::as_slice);
-        let may = [group_rules.as_slice(), node_rules, self.default_rules.as_slice()].concat().iter().any(|r| r.gives(peer, Perm::Create));
+        let may = self.allowed_in_group(group, peer, Perm::Create);
         // Someone who didn't say who they are would be made admin of it, as anyone.
         if !group_dir.is_dir() {
             return Err(Refusal::new(Status::NotFound, "Not found"));
