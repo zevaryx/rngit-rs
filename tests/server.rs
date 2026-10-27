@@ -906,7 +906,7 @@ async fn forks_and_mirrors_are_refused_what_they_should_be() {
     let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
     let reply = |result: Result<(), Error>| result.unwrap_err().to_string();
     // Sources that aren't rns:// ones, and ones that aren't sources.
-    assert!(reply(me.fork(&new_url(), "https://example.com/x.git").await).contains("Prohibited source URL"));
+    assert!(reply(me.fork(&new_url(), "https://127.0.0.1/x.git").await).contains("Prohibited source URL"));
     assert!(reply(me.fork(&new_url(), "git@example.com:x.git").await).contains("Prohibited source URL"));
     assert!(reply(me.fork(&new_url(), "rns://nope").await).contains("Invalid source URL"));
     assert!(reply(me.fork(&new_url(), "").await).contains("No source specified"));
@@ -948,4 +948,177 @@ async fn forks_and_mirrors_are_refused_what_they_should_be() {
     git(&tmp.path().join("repos/public/new.git"), &["config", "repository.rngit.upstream.source", missing]);
     assert!(reply(me.sync(&new_url()).await).contains("sync failed"));
     assert_eq!(git(&tmp.path().join("repos/public/new.git"), &["rev-parse", "main"]), before);
+}
+
+/// Serves `repo` over smart HTTP (what an https:// source speaks), by way of git's own
+/// `upload-pack`. It stops when the returned flag is set.
+#[cfg(feature = "https")]
+fn serve_http(repo: std::path::PathBuf) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}/demo.git", listener.local_addr().unwrap());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            let Ok((stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let (mut length, mut chunked, mut protocol) = (0usize, false, String::new());
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end().to_string();
+                if header.is_empty() {
+                    break;
+                }
+                let lower = header.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                    chunked = true;
+                } else if lower.starts_with("git-protocol:") {
+                    protocol = header["git-protocol:".len()..].trim().to_string();
+                }
+            }
+            let mut body = Vec::new();
+            if chunked {
+                loop {
+                    let mut size = String::new();
+                    reader.read_line(&mut size).unwrap();
+                    let size = usize::from_str_radix(size.trim(), 16).unwrap();
+                    let mut chunk = vec![0; size + 2];
+                    reader.read_exact(&mut chunk).unwrap();
+                    if size == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..size]);
+                }
+            } else {
+                body.resize(length, 0);
+                reader.read_exact(&mut body).unwrap();
+            }
+            let advertise = line.contains("info/refs");
+            let mut command = Command::new("git");
+            command.arg("upload-pack").arg("--stateless-rpc");
+            if advertise {
+                command.arg("--advertise-refs");
+            }
+            let mut child = command.arg(&repo).env("GIT_PROTOCOL", &protocol).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&body).unwrap();
+            let out = child.wait_with_output().unwrap().stdout;
+            let mut reply = Vec::new();
+            if advertise && !protocol.contains("version=2") {
+                reply.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+            }
+            reply.extend_from_slice(&out);
+            let kind = if advertise { "advertisement" } else { "result" };
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-{kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.len()
+            )
+            .unwrap();
+            stream.write_all(&reply).unwrap();
+        }
+    });
+    (base, stop)
+}
+
+#[cfg(feature = "https")]
+#[tokio::test]
+async fn a_mirror_and_a_fork_can_follow_a_repository_served_over_http() {
+    let (source_tmp, _source, _work) = node("r:all");
+    let source_repo = source_tmp.path().join("repos/public/demo.git");
+    let (source, stop) = serve_http(source_repo.clone());
+    let (tmp, mut node) = open_node();
+    node.default_rules = Rule::parse("c:all, r:all");
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let (mirror, fork) = (new_url(), "rns://00112233445566778899aabbccddeeff/public/forked".parse::<RepoUrl>().unwrap());
+
+    // A source on the node's own network, or without TLS, isn't taken unless the node is told it may.
+    let refused = client.mirror(&mirror, &source).await.unwrap_err().to_string();
+    assert!(refused.contains("Prohibited source URL"), "{refused}");
+    assert!(!served(&tmp).exists());
+
+    node.open_sources = true;
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    client.mirror(&mirror, &source).await.unwrap();
+    client.fork(&fork, &source).await.unwrap();
+    let (mirrored, forked) = (served(&tmp), tmp.path().join("repos/public/forked.git"));
+    for dir in [&mirrored, &forked] {
+        assert_eq!(git(dir, &["rev-parse", "main"]), git(&source_repo, &["rev-parse", "main"]));
+        assert_eq!(git(dir, &["rev-parse", "topic"]), git(&source_repo, &["rev-parse", "topic"]));
+        assert_eq!(git(dir, &["cat-file", "-t", "v2"]), "tag");
+        git(dir, &["fsck", "--strict"]);
+        assert_eq!(git(dir, &["config", "repository.rngit.upstream.source"]), source);
+    }
+    assert_eq!(git(&mirrored, &["symbolic-ref", "HEAD"]), git(&source_repo, &["symbolic-ref", "HEAD"]));
+
+    // The source adds a tag and a branch, drops one, and moves HEAD.
+    git(&source_repo, &["branch", "later", "main"]);
+    git(&source_repo, &["tag", "v9", "main"]);
+    git(&source_repo, &["branch", "-D", "topic"]);
+    git(&source_repo, &["symbolic-ref", "HEAD", "refs/heads/later"]);
+    client.sync(&mirror).await.unwrap();
+    client.sync(&fork).await.unwrap();
+    for dir in [&mirrored, &forked] {
+        assert_eq!(git(dir, &["rev-parse", "later"]), git(&source_repo, &["rev-parse", "later"]));
+        assert_eq!(git(dir, &["cat-file", "-t", "v9"]), "commit");
+        assert!(git(dir, &["branch", "--list", "topic"]).is_empty(), "the branch the source dropped");
+        git(dir, &["fsck", "--strict"]);
+    }
+    assert_eq!(git(&mirrored, &["symbolic-ref", "HEAD"]), "refs/heads/later");
+
+    // A source that stops answering fails the sync and leaves the repository as it was.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let before = git(&mirrored, &["rev-parse", "later"]);
+    assert!(client.sync(&mirror).await.unwrap_err().to_string().contains("Mirror sync failed"));
+    assert_eq!(git(&mirrored, &["rev-parse", "later"]), before);
+}
+
+#[tokio::test]
+async fn sources_that_are_not_rns_or_https_are_refused() {
+    let (_tmp, node) = open_node();
+    let client = Client::new(Direct { node, peer: Some(ME), key: None });
+    for source in [
+        "ssh://git@example.com/a/b.git",
+        "git@example.com:a/b.git",
+        "file:///etc",
+        "/etc",
+        "https://user:pw@8.8.8.8/a.git",
+        "https://127.0.0.1/a.git",
+        "https://[::1]/a.git",
+    ] {
+        let refused = client.mirror(&new_url(), source).await.unwrap_err().to_string();
+        assert!(refused.contains("Prohibited source URL") || refused.contains("Invalid source URL"), "{source}: {refused}");
+    }
+}
+
+#[cfg(feature = "https")]
+#[tokio::test]
+async fn a_source_that_is_larger_than_a_repository_may_be_is_not_kept() {
+    let (source_tmp, _source, _work) = node("r:all");
+    let (source, stop) = serve_http(source_tmp.path().join("repos/public/demo.git"));
+    let (tmp, mut node) = open_node();
+    node.default_rules = Rule::parse("c:all, r:all");
+    node.open_sources = true;
+    node.quotas.max_repo_bytes = 1;
+    let client = Client::new(Direct { node, peer: Some(ME), key: None });
+    let refused = client.mirror(&new_url(), &source).await.unwrap_err().to_string();
+    assert!(refused.contains("Failed to fetch from source"), "{refused}");
+    assert!(!served(&tmp).exists());
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join("repos/public")).unwrap().flatten().collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }

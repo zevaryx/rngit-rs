@@ -32,6 +32,8 @@ mod perms;
 mod releases;
 mod support;
 mod upstream;
+#[cfg(feature = "https")]
+mod web;
 mod work;
 
 /// The hash stock rngit gives a peer that didn't identify itself.
@@ -149,6 +151,9 @@ pub struct Node {
     /// What fetches from other nodes, for forks, mirrors and syncs. Without
     /// one they are refused.
     pub upstream: Option<Arc<dyn Upstream>>,
+    /// Let forks and mirrors take `http://` sources and sources on this
+    /// node's own network, which they don't by default. For labs and tests.
+    pub open_sources: bool,
 }
 
 /// Who sent a request: the identity hash they proved on their link, and the

@@ -8,10 +8,13 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/zevaryx/rngit-rs"
 
 [features]
-default = ["reticulum"]
+default = ["reticulum", "https"]
 # Transport over a live Reticulum link (rsReticulum). Turn it off to use the
 # protocol layer with your own `Transport`.
 reticulum = ["dep:rns-runtime", "dep:rns-identity", "dep:tokio"]
+# Forks and mirrors of https:// repositories (a node's own fetching, in-process
+# with gix; nothing is run). Pulls in an HTTP client and TLS.
+https = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwest-rust-tls"]
 
 [[bin]]
 name = "git-remote-rns"
