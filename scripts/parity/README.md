@@ -1,4 +1,6 @@
-# Parity test against stock rngit
+# Parity tests against stock rngit
+
+Two scripts share one lab: `parity.py` covers git (below) and `parity_mgmt.py` covers the management calls.
 
 `parity.py` runs one long scenario twice against the same stock rngit node: once through
 the stock `git-remote-rns` and once through ours. The scenario covers clone (empty, after a
@@ -31,3 +33,19 @@ resulting repositories are identical, so `parity.py` ignores that list's content
 
 Also checked by hand with the same two helpers, on a group with only `r:all`: clone works, and a
 push and a branch delete are both refused at the listing, with the same requests and exit code.
+
+## Management calls
+
+`parity_mgmt.py` runs create, permissions, work documents, releases, fork and sync through the stock
+`rngit` command and ours, against the same node, and compares the requests the node received and
+the files it ended up with. Besides the lab above:
+
+- put both client identities in the node's `[access]` line as admins, with `rel:all, i:all, p:all`
+  for everyone, and set `PARITY_STOCK_ID` and `PARITY_OURS_ID` to their identity hashes (the file
+  `client_identity` in each client config folder);
+- set `PARITY_STOCK` to the folder with stock's `rngit` and `git-remote-rns`;
+- `editor.sh` stands in for `$EDITOR`, which stock opens for every text it asks for.
+
+Run `python3 -I parity_mgmt.py TAG`. Some flows differ on purpose: stock's `perms` always reads and
+then writes through an editor, and `work edit` views the document first, so those steps compare only
+the write request. Stock asks before a delete, so the script answers `y`.

@@ -11,7 +11,7 @@ TRACE = os.environ.get("TRACE_LOG", LAB + "/par/server.trace")
 REPOS = os.environ.get("PARITY_REPOS", LAB + "/repos/public")  # the node's "public" group directory
 OURS = os.environ.get("PARITY_OURS", os.path.abspath(os.path.join(os.path.dirname(__file__), "../../target/debug")))
 HELPERS = {
-  "stock": dict(PATH="/usr/local/bin:" + os.environ["PATH"], RNS_CONFIG=LAB + "/pycli", RNGIT_CONFIG=LAB + "/pycli-git"),
+  "stock": dict(PATH=os.environ.get("PARITY_STOCK", "/usr/local/bin") + ":" + os.environ["PATH"], RNS_CONFIG=LAB + "/pycli", RNGIT_CONFIG=LAB + "/pycli-git"),
   "ours": dict(PATH=OURS + ":" + os.environ["PATH"], RNS_CONFIG=LAB + "/cli", RNGIT_CONFIG=LAB + "/rngit-cli", RNGIT_PATH_WAIT="2"),
 }
 BASE = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
