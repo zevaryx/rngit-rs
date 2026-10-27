@@ -9,12 +9,12 @@
 //! branch and tag as the source has it. A mirror's HEAD follows the source's;
 //! a fork's is left to whoever keeps it (the pull sets it only when the repository is made).
 //!
-//! Sources are `rns://` repositories only. Stock also fetches `http`, `https`
-//! and `ssh` sources by running `git`; this node runs nothing. What fetches is
-//! whatever the node is given as its [`Upstream`] (see [`crate::serve::upstream`]),
-//! with the node's own identity, so a sender can have it read what only the
-//! node may read: who may fork and mirror (`c` on a group) is who the node trusts
-//! with that.
+//! Sources are `rns://` repositories, fetched by the node's [`Upstream`] (see
+//! [`crate::serve::upstream`]) with the node's own identity, and `https://`
+//! ones, fetched in this process (see `web`). Stock also fetches `ssh` sources
+//! by running `git`; this node runs nothing. A sender picks the source, so
+//! who may fork and mirror (`c` on a group) is who the node trusts to have it
+//! read what only the node may read.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -90,8 +90,25 @@ fn write_following(repo: &Path, kind: Option<Kind>, source: &str, synced: u64) -
     write_file(&config_path(repo), &config.to_bstring()).map_err(drop)
 }
 
+/// Where a fork or mirror gets its commits.
+enum Source {
+    /// A repository on an rngit node, fetched by the node's [`Upstream`].
+    Rns(RepoUrl),
+    /// An `https://` repository, fetched in this process.
+    Web(String),
+}
+
+impl Source {
+    fn parse(written: &str) -> Option<Source> {
+        match written.parse::<RepoUrl>() {
+            Ok(url) => Some(Source::Rns(url)),
+            Err(_) => written.to_ascii_lowercase().starts_with("http").then(|| Source::Web(written.to_string())),
+        }
+    }
+}
+
 /// The source a request names, as it was written and as an address.
-fn rns_source(map: &MapRef) -> Result<(String, RepoUrl), Refusal> {
+fn named_source(map: &MapRef, open: bool) -> Result<(String, Source), Refusal> {
     let source = match map.get("source") {
         None => return Err(refuse(Status::BadRequest, "No source specified")),
         Some(Value::String(s)) => s.as_str().unwrap_or_default().to_string(),
@@ -100,11 +117,20 @@ fn rns_source(map: &MapRef) -> Result<(String, RepoUrl), Refusal> {
     if source.is_empty() {
         return Err(refuse(Status::BadRequest, "No source specified"));
     }
-    if !source.to_ascii_lowercase().starts_with("rns://") {
-        return Err(refuse(Status::NotAllowed, "Prohibited source URL: this node forks and mirrors from rns:// repositories only"));
+    let lower = source.to_ascii_lowercase();
+    if lower.starts_with("rns://") {
+        let url = source.parse().map_err(|_| refuse(Status::BadRequest, "Invalid source URL"))?;
+        return Ok((source, Source::Rns(url)));
     }
-    let url = source.parse().map_err(|_| refuse(Status::BadRequest, "Invalid source URL"))?;
-    Ok((source, url))
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        #[cfg(feature = "https")]
+        {
+            super::web::check(&source, open).map_err(|e| refuse(Status::NotAllowed, &e))?;
+            return Ok((source.clone(), Source::Web(source)));
+        }
+    }
+    let _ = open;
+    Err(refuse(Status::NotAllowed, "Prohibited source URL: this node forks and mirrors from rns:// and https:// repositories only"))
 }
 
 impl Node {
@@ -114,8 +140,19 @@ impl Node {
 
     /// Fetch from `source` into the repository at `dir`, and check it hasn't
     /// grown past what a repository may.
-    fn pull_into(&self, source: &RepoUrl, dir: &Path) -> Result<(), String> {
-        self.upstream.as_deref().ok_or("This node can't fetch from other nodes")?.pull(source, dir, self.max_request_time)?;
+    fn pull_into(&self, source: &Source, dir: &Path) -> Result<(), String> {
+        match source {
+            Source::Rns(url) => {
+                self.upstream.as_deref().ok_or("This node can't fetch from other nodes")?.pull(url, dir, self.max_request_time)?
+            }
+            #[cfg(feature = "https")]
+            Source::Web(url) => {
+                super::web::check(url, self.open_sources)?;
+                super::web::pull(url, dir, self.max_request_time, self.quotas.max_repo_bytes)?
+            }
+            #[cfg(not(feature = "https"))]
+            Source::Web(url) => return Err(format!("This node was built without https:// sources, so can't fetch {url}")),
+        }
         if dir_size(dir) > self.quotas.max_repo_bytes {
             return Err("The repository is larger than this node keeps".into());
         }
@@ -128,7 +165,7 @@ impl Node {
         if *peer == super::NULL_IDENT {
             return Err(refuse(Status::NotAllowed, "Not identified"));
         }
-        let (written, source) = rns_source(map)?;
+        let (written, source) = named_source(map, self.open_sources)?;
         let name = int_key(request, 0).ok_or(refuse(Status::BadRequest, "No repository specified"))?;
         let (group, repo) = split_repo_path(&name).ok_or(refuse(Status::BadRequest, "Invalid request"))?;
         let group_dir = self.root.join(group);
@@ -154,7 +191,9 @@ impl Node {
         if kept >= self.quotas.max_repos_per_group {
             return Err(refuse(Status::ServerError, "Too many repositories in this group"));
         }
-        self.upstream_or_refuse()?;
+        if matches!(source, Source::Rns(_)) {
+            self.upstream_or_refuse()?;
+        }
 
         // Made beside where it will be, under a name nothing serves, and moved into place once whole.
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
@@ -194,14 +233,16 @@ impl Node {
             return Err(refuse(Status::NotAllowed, "Not allowed"));
         }
         let following = read_following(&dir).ok_or(refuse(Status::BadRequest, "Repository is neither fork nor mirror"))?;
-        self.upstream_or_refuse()?;
+        if matches!(Source::parse(&following.source), Some(Source::Rns(_))) {
+            self.upstream_or_refuse()?;
+        }
         self.follow(&dir, &following)
             .map(|()| ack())
             .map_err(|_| refuse(Status::ServerError, if following.kind == Kind::Fork { "Fork sync failed" } else { "Mirror sync failed" }))
     }
 
     fn follow(&self, dir: &Path, following: &Following) -> Result<(), String> {
-        let source: RepoUrl = following.source.parse().map_err(|_| "The source isn't an rns:// repository".to_string())?;
+        let source = Source::parse(&following.source).ok_or("The source isn't an rns:// or https:// repository")?;
         // A fork's HEAD is its keeper's to move; the pull sets it from the source's.
         let head = (following.kind == Kind::Fork).then(|| std::fs::read(dir.join("HEAD")).ok()).flatten();
         self.pull_into(&source, dir)?;
