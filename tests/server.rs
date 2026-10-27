@@ -429,3 +429,174 @@ fn a_delta_counts_as_the_object_it_makes() {
     assert!(rngit::bundle::check_pack(pack, hash, limits(300_000)).is_err());
     assert!(rngit::bundle::check_pack(&pack[..pack.len() / 2], hash, limits(1 << 30)).is_err());
 }
+
+struct Key(ed25519_dalek::SigningKey, [u8; 64]);
+
+impl Key {
+    fn new(seed: u8) -> Self {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let mut public = [seed; 64];
+        public[32..].copy_from_slice(key.verifying_key().as_bytes());
+        Key(key, public)
+    }
+}
+
+impl rngit::sign::Signer for Key {
+    fn identity_hash(&self) -> [u8; 16] {
+        rngit::sign::identity_hash(&self.1)
+    }
+    fn public_key(&self) -> [u8; 64] {
+        self.1
+    }
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], Error> {
+        use ed25519_dalek::Signer as _;
+        Ok(self.0.sign(message).to_bytes())
+    }
+}
+
+async fn released(client: &Client<Direct>, tag: &str, files: &[(String, Vec<u8>)]) -> Result<(), Error> {
+    client.create_release(&url(), &Key::new(5), tag, None, "Notes\nmore", files, "2026-10-26T00:00:00Z", 1_700_000_000).await
+}
+
+#[tokio::test]
+async fn releases_are_made_listed_fetched_made_latest_and_deleted() {
+    let (tmp, node, _) = node(&format!("r:all\nrel:{}", hex::encode(ME)));
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME) });
+    let files = vec![("app.txt".to_string(), b"the app".to_vec()), ("lib.bin".to_string(), vec![1, 2, 3])];
+
+    // Nothing yet: the list is an empty one, not an error.
+    let none = me.releases(&url()).await.unwrap();
+    assert!(none.releases.is_empty() && none.latest.is_none());
+
+    released(&me, "v1", &files).await.unwrap();
+    let list = me.releases(&url()).await.unwrap();
+    assert_eq!(list.latest.as_deref(), Some("v1"));
+    assert_eq!((list.releases[0].tag.as_str(), list.releases[0].status.as_str()), ("v1", "published"));
+    // Two files, a signature each, and the manifest.
+    assert_eq!(list.releases[0].artifacts, 5);
+    assert_eq!(list.releases[0].created_by, hex::encode(ME));
+    assert_eq!(list.releases[0].preview, "Notes\nmore");
+
+    // It's kept as stock rngit keeps it.
+    let folder = tmp.path().join("repos/public/demo.git.releases");
+    let meta = std::fs::read_to_string(folder.join("v1/META")).unwrap();
+    assert!(meta.contains("tag = v1") && meta.contains("status = published"), "{meta}");
+    assert_eq!(std::fs::read_to_string(folder.join("latest")).unwrap(), "v1");
+    assert_eq!(std::fs::read_to_string(folder.join("v1/RELEASE.md")).unwrap(), "Notes\nmore");
+
+    // Viewed, fetched by tag and as latest, and verified against the signatures.
+    let detail = me.release(&url(), "latest").await.unwrap();
+    assert_eq!((detail.tag.as_str(), detail.notes.as_str()), ("v1", "Notes\nmore"));
+    assert!(detail.artifacts.iter().any(|a| a.name == "lib.bin" && a.size == 3));
+    assert_eq!(me.fetch_artifact(&url(), "v1", "app.txt").await.unwrap(), b"the app");
+    assert_eq!(me.fetch_artifact(&url(), "latest", "lib.bin").await.unwrap(), [1, 2, 3]);
+    let (manifest, got) = me.fetch_verified_release(&url(), "v1").await.unwrap();
+    assert_eq!(manifest.version, "v1");
+    assert_eq!(got.len(), 2);
+
+    // A second release, then the first made latest again, then one deleted.
+    released(&me, "v2", &files[..1]).await.unwrap();
+    assert_eq!(me.releases(&url()).await.unwrap().latest.as_deref(), Some("v2"));
+    me.set_latest_release(&url(), "v1").await.unwrap();
+    assert_eq!(me.releases(&url()).await.unwrap().latest.as_deref(), Some("v1"));
+    me.delete_release(&url(), "v2").await.unwrap();
+    assert!(!folder.join("v2").exists());
+    let gone = me.release(&url(), "v2").await.unwrap_err().to_string();
+    assert!(gone.contains("not found") || gone.contains("Not found") || gone.contains("Release not found"), "{gone}");
+
+    // Taken tags, and tags the repository doesn't have.
+    assert!(released(&me, "v1", &files).await.unwrap_err().to_string().contains("already exists"));
+    assert!(released(&me, "nope", &files).await.unwrap_err().to_string().contains("does not exist in repository"));
+    assert!(!folder.join("nope").exists());
+    assert!(me.set_latest_release(&url(), "nope").await.is_err());
+}
+
+#[tokio::test]
+async fn releasing_needs_the_permission_and_everyone_identified() {
+    let (_tmp, node, _) = node(&format!("r:all\nrel:{}", hex::encode(ME)));
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME) });
+    released(&me, "v1", &[("a".into(), b"a".to_vec())]).await.unwrap();
+
+    // A reader sees them; changing needs `rel`.
+    let reader = Client::new(Direct { node: node.clone(), peer: Some([9; 16]) });
+    assert_eq!(reader.releases(&url()).await.unwrap().releases.len(), 1);
+    assert_eq!(reader.fetch_artifact(&url(), "v1", "a").await.unwrap(), b"a");
+    for error in [
+        released(&reader, "v2", &[]).await.unwrap_err().to_string(),
+        reader.delete_release(&url(), "v1").await.unwrap_err().to_string(),
+        reader.set_latest_release(&url(), "v1").await.unwrap_err().to_string(),
+    ] {
+        assert!(error.to_lowercase().contains("not allowed"), "{error}");
+    }
+
+    // Someone who didn't identify themselves gets nothing, as stock does.
+    let anonymous = Client::new(Direct { node: node.clone(), peer: None });
+    assert!(anonymous.releases(&url()).await.unwrap_err().to_string().contains("Not identified"));
+    // Nor does someone who can't read the repository learn it has releases.
+    let (_t, closed, _) = self::node("");
+    let stranger = Client::new(Direct { node: closed, peer: Some([9; 16]) });
+    assert!(stranger.releases(&url()).await.unwrap_err().to_string().contains("Not found"));
+}
+
+#[test]
+fn a_release_is_written_only_while_it_is_a_draft_and_within_its_limits() {
+    let (tmp, mut node, _) = node(&format!("adm:{}", hex::encode(ME)));
+    node.quotas.max_artifact_bytes = 10;
+    node.quotas.max_release_bytes = 15;
+    let ask = |extra: &[(&str, rmpv::Value)]| {
+        let mut all = vec![("operation", rmpv::Value::from("create"))];
+        all.extend(extra.iter().cloned());
+        text(&node.handle("/mgmt/release", &rmpv_request("public/demo.git", &all), Some(ME)).unwrap())
+    };
+    let step = |name: &str, extra: &[(&str, rmpv::Value)]| {
+        let mut all = vec![("step", rmpv::Value::from(name)), ("tag", rmpv::Value::from("v1"))];
+        all.extend(extra.iter().cloned());
+        ask(&all)
+    };
+    let file = |name: &str, size: usize| {
+        step("artifact", &[("artifact_name", name.into()), ("artifact_data", rmpv::Value::Binary(vec![0; size]))])
+    };
+    assert_eq!(step("init", &[]).0, 0);
+    assert_eq!(file("one", 8).0, 0);
+    // Too big for one file; too big for the release; names that leave the folder; no data.
+    assert_eq!(file("two", 11), (2, "Artifact is too large".into()));
+    assert_eq!(file("two", 8), (2, "Release is too large".into()));
+    for name in ["../x", "a/b", "", ".hidden", "a\\b"] {
+        assert_eq!(file(name, 1).0, 2, "{name}");
+    }
+    assert_eq!(step("artifact", &[("artifact_name", "x".into())]).0, 2);
+    // Replacing a file counts what it replaces.
+    assert_eq!(file("one", 10).0, 0);
+    // Tags that mean a folder up are no tags.
+    for tag in ["../v1", "a/b", "..", ".", ""] {
+        let reply = ask(&[("step", "init".into()), ("tag", tag.into())]);
+        assert_eq!(reply.0, 2, "{tag}: {reply:?}");
+    }
+    assert_eq!(step("finalize", &[]).0, 0);
+    // Finalized: nothing more goes in, and it can't be finished twice.
+    assert_eq!(file("late", 1), (1, "Release was finalized and is not writable".into()));
+    assert_eq!(step("finalize", &[]).0, 1);
+    assert_eq!(step("init", &[]).0, 1);
+    assert_eq!(ask(&[("step", "bogus".into())]).0, 2);
+    assert!(!tmp.path().join("repos/public/demo.git.releases/late").exists());
+    let kept: Vec<_> = std::fs::read_dir(tmp.path().join("repos/public/demo.git.releases/v1/artifacts")).unwrap().flatten().collect();
+    assert_eq!(kept.len(), 1);
+}
+
+#[test]
+fn what_is_asked_of_releases_is_checked_before_anything_is_read() {
+    let (_tmp, node, _) = node(&format!("adm:{}", hex::encode(ME)));
+    let ask =
+        |extra: &[(&str, rmpv::Value)]| text(&node.handle("/mgmt/release", &rmpv_request("public/demo.git", extra), Some(ME)).unwrap());
+    assert_eq!(ask(&[]).0, 2);
+    assert_eq!(ask(&[("operation", "explode".into())]).0, 2);
+    // `latest` with none made; a tag that leaves the folder; an artifact that does.
+    assert_eq!(ask(&[("operation", "view".into()), ("tag", "latest".into())]).0, 3);
+    assert_eq!(ask(&[("operation", "view".into()), ("tag", "../x".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "view".into()), ("tag", "nope".into())]).0, 3);
+    assert_eq!(ask(&[("operation", "fetch".into()), ("tag", "v1".into()), ("artifact", "../../x".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "delete".into()), ("tag", "..".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "list".into())]).0, 0);
+    let elsewhere = node.handle("/mgmt/release", &rmpv_request("../etc/x.git", &[("operation", "list".into())]), Some(ME)).unwrap();
+    assert_eq!(text(&elsewhere).0, 3);
+}

@@ -38,7 +38,7 @@ push and a branch delete are both refused at the listing, with the same requests
 
 `rngit serve DIR r:all` hosts the repositories in `DIR` (`group/name.git`) from a client Reticulum
 config. Clone from it with the stock `git-remote-rns` (use the `.git` suffix in the URL, as stock
-sends the path as typed) and with ours. Pushing, `rngit create` and deleting a branch work the same way, with rules such as `"c:all, rw:all"`.
+sends the path as typed) and with ours. Pushing, `rngit create` and deleting a branch work the same way, with rules such as `"c:all, rw:all"`. Releases work too (`rel:all` lets everyone publish): stock's `rngit release` creates, lists, views, fetches, makes latest and deletes them.
 
 ## Management calls
 

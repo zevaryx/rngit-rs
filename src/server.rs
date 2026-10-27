@@ -2,10 +2,10 @@
 //!
 //! [`Node`] answers the requests of the protocol from repositories in a
 //! folder, with no network in it: the caller hands over a request path, its
-//! body and who sent it, and sends back what [`Node::handle`] returns. This
-//! first part reads only: `/git/list` and `/git/fetch`. Everything else is
-//! answered "not allowed", as a node would answer a client with no write
-//! permission.
+//! body and who sent it, and sends back what [`Node::handle`] returns. It
+//! answers `/git/list`, `/git/fetch`, `/git/push`, `/git/create`,
+//! `/git/delete` and `/mgmt/release`. Everything else is answered "not
+//! allowed", as a node would answer a client with no permission.
 //!
 //! The folder holds one folder per group and `name.git` repositories in each.
 //! Who may do what comes from `.allowed` files, see [`Rule`].
@@ -24,6 +24,8 @@ use crate::bundle;
 use crate::error::Status;
 use crate::transport::Response;
 use crate::wire::{self, MapRef};
+
+mod releases;
 
 /// The hash stock rngit gives a peer that didn't identify itself.
 pub const NULL_IDENT: [u8; 16] = [0xd7, 0xdb, 0x22, 0xf6, 0x3b, 0x45, 0x3c, 0x23, 0xbb, 0x06, 0x88, 0xdd, 0xe5, 0x65, 0xb7, 0xc1];
@@ -150,6 +152,10 @@ pub struct Node {
 pub struct Quotas {
     /// Largest bundle taken in a push.
     pub max_push_bytes: usize,
+    /// Largest file added to a release.
+    pub max_artifact_bytes: usize,
+    /// What one release's files may come to.
+    pub max_release_bytes: u64,
     /// What one repository may come to on disk, counting a push.
     pub max_repo_bytes: u64,
     /// Repositories in one group.
@@ -161,6 +167,8 @@ impl Default for Quotas {
     fn default() -> Self {
         Quotas {
             max_push_bytes: 256 * 1024 * 1024,
+            max_artifact_bytes: 64 * 1024 * 1024,
+            max_release_bytes: 256 * 1024 * 1024,
             max_repo_bytes: 1024 * 1024 * 1024,
             max_repos_per_group: 1000,
             pack: bundle::PackLimits {
@@ -255,7 +263,12 @@ impl Node {
                 return Err(Refusal::new(Status::NotAllowed, "Not allowed"));
             }
             // A push carries its bundle.
-            let most = if path == "/git/push" { MAX_REQUEST_BYTES + self.quotas.max_push_bytes } else { MAX_REQUEST_BYTES };
+            let most = match path {
+                "/git/push" => MAX_REQUEST_BYTES + self.quotas.max_push_bytes,
+                // A release's file comes in one request.
+                "/mgmt/release" => MAX_REQUEST_BYTES + self.quotas.max_artifact_bytes,
+                _ => MAX_REQUEST_BYTES,
+            };
             if data.len() > most {
                 return Err(Refusal::new(Status::BadRequest, "Request is too large"));
             }
@@ -267,6 +280,7 @@ impl Node {
                 "/git/push" => self.push(&request, &map, &peer),
                 "/git/create" => self.create(&request, &peer),
                 "/git/delete" => self.delete_ref(&request, &map, &peer),
+                "/mgmt/release" => self.release(&request, &map, &peer),
                 _ => Err(Refusal::new(Status::NotAllowed, "Not allowed")),
             }
         })();
