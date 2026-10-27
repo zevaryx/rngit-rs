@@ -11,6 +11,7 @@ pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod helper;
+pub mod local;
 #[cfg(feature = "reticulum")]
 pub mod rns;
 #[cfg(feature = "reticulum")]

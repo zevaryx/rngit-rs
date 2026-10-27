@@ -259,3 +259,35 @@ async fn push_all_reports_what_it_did() {
     let (result, _) = cli(&client, &["push-all", URL], "").await;
     assert!(matches!(result, Err(Error::InvalidInput(_))));
 }
+
+#[tokio::test]
+async fn a_copy_is_read_with_log_tree_and_show() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, copy) = (tmp.path().join("work"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    std::fs::write(work.join("bin"), [0u8, 159, 146]).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "binary"]);
+    bare_repo(&copy);
+    git(&work, &["push", "-q", copy.to_str().unwrap(), "main"]);
+    let client = Client::new(canned(copy.clone()));
+    let dir = copy.to_str().unwrap();
+
+    let (result, text) = cli(&client, &["log", dir, "refs/heads/main", "2"], "").await;
+    result.unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 2 && lines[0].ends_with(" binary") && lines[1].ends_with(" commit 1"), "{text}");
+    let (result, text) = cli(&client, &["tree", dir, "refs/heads/main"], "").await;
+    result.unwrap();
+    assert!(text.contains("file0.txt  ") && text.contains("bin  3"), "{text}");
+    let (result, text) = cli(&client, &["show", dir, "refs/heads/main", "file0.txt"], "").await;
+    result.unwrap();
+    assert!(text.contains("content 0"), "{text}");
+    let (result, text) = cli(&client, &["show", dir, "refs/heads/main", "bin"], "").await;
+    result.unwrap();
+    assert_eq!(text, "binary file, 3 bytes\n");
+    for args in [&["log", dir][..], &["log", dir, "refs/heads/main", "many"], &["show", dir, "refs/heads/main"], &["tree", dir, "main"]] {
+        let (result, _) = cli(&client, args, "").await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))), "{args:?}");
+    }
+}

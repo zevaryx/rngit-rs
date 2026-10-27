@@ -24,6 +24,10 @@ Repositories (URL is rns://<destination>/<group>/<repo>):
   push-all URL DIR [force] [prune]   push every branch and tag of the repository in DIR
   delete-ref URL REF            delete a branch or tag on the node (REF is refs/heads/NAME or refs/tags/NAME)
   sync URL                      update a fork or mirror from its source
+A copy on this computer (DIR is a bare repository, REF is refs/heads/NAME or refs/tags/NAME):
+  log DIR REF [COUNT]           the newest commits
+  tree DIR REF [PATH]           the files in a folder
+  show DIR REF PATH             a file's text
 Permissions (TEXT is the new file content, or - to read standard input):
   perms URL [TEXT]              show or replace a repository's permissions
   gperms URL [TEXT]             show or replace the permissions of URL's group
@@ -79,6 +83,43 @@ fn commit_of_tag(tag: &str) -> Option<String> {
     Some(reference.peel_to_commit().ok()?.id.to_string())
 }
 
+/// The commands that read a copy on this computer, which need no node.
+fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Result<()> {
+    let arg =
+        |n: usize, what: &str| rest.get(n).map(String::as_str).ok_or_else(|| Error::InvalidInput(format!("{command}: missing {what}")));
+    let (dir, refname) = (Path::new(arg(0, "DIR")?), arg(1, "REF")?);
+    match command {
+        "log" => {
+            let count = match rest.get(2) {
+                Some(n) => n.parse().map_err(|_| Error::InvalidInput(format!("{n:?} is not a count")))?,
+                None => 20,
+            };
+            for commit in crate::local::log(dir, refname, count)? {
+                say(out, format!("{} {} {} {}", commit.id, iso8601(commit.time.max(0) as u64), commit.author, commit.subject))?;
+            }
+        }
+        "tree" => {
+            for entry in crate::local::tree(dir, refname, rest.get(2).map_or("", String::as_str))? {
+                let mark = match entry.kind {
+                    crate::local::EntryKind::Dir => "/",
+                    crate::local::EntryKind::Link => "@",
+                    crate::local::EntryKind::Submodule => "#",
+                    crate::local::EntryKind::File => "",
+                };
+                say(out, format!("{}{mark}{}", entry.name, entry.size.map_or(String::new(), |size| format!("  {size}"))))?;
+            }
+        }
+        _ => {
+            let view = crate::local::file(dir, refname, arg(2, "PATH")?, 1024 * 1024)?;
+            match view.text {
+                Some(text) => write!(out, "{text}").map_err(Error::git)?,
+                None => say(out, format!("binary file, {} bytes", view.size))?,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn iso8601(secs: u64) -> String {
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
@@ -109,6 +150,9 @@ pub async fn run<T: Transport>(
         |n: usize, what: &str| rest.get(n).map(String::as_str).ok_or_else(|| Error::InvalidInput(format!("{command}: missing {what}")));
     if matches!(command.as_str(), "help" | "-h" | "--help") {
         return say(out, USAGE.trim_end());
+    }
+    if matches!(command.as_str(), "log" | "tree" | "show") {
+        return local_command(command, rest, out);
     }
     let repo: RepoUrl = arg(0, "URL")?.parse()?;
     match command.as_str() {
