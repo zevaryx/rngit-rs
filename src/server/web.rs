@@ -67,10 +67,10 @@ fn public_v6(ip: Ipv6Addr) -> bool {
     !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80)
 }
 
-/// Fetch every branch and tag of `source` into the bare repository at `dest`,
-/// removing those the source no longer has, and point HEAD where the source's
-/// does. Gives up after `timeout`, or once `dest` is bigger than `max_bytes`.
-pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64) -> Result<(), String> {
+/// Fetch every branch and tag of `source` into the bare repository at `dest`
+/// and point HEAD where the source's does. Gives the names of the refs the
+/// source has. Gives up after `timeout`, or once `dest` is bigger than `max_bytes`.
+pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64) -> Result<Vec<String>, String> {
     use gix::protocol::handshake::Ref;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -126,25 +126,11 @@ pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64)
             Ref::Unborn { .. } => {}
         }
     }
-    // What the source dropped.
-    let platform = repo.references().map_err(|e| e.to_string())?;
-    let local: Vec<String> = platform
-        .local_branches()
-        .map_err(|e| e.to_string())?
-        .chain(platform.tags().map_err(|e| e.to_string())?)
-        .flatten()
-        .map(|r| r.name().as_bstr().to_string())
-        .collect();
-    for name in local.into_iter().filter(|n| !kept.contains(n)) {
-        if let Ok(reference) = repo.find_reference(name.as_str()) {
-            let _ = reference.delete();
-        }
-    }
     if let Some(head) = head.filter(|h| h.starts_with("refs/heads/") && !h.contains(['\n', '\0'])) {
         super::support::write_file(&dest.join("HEAD"), format!("ref: {head}\n").as_bytes())
             .map_err(|_| "Could not set HEAD".to_string())?;
     }
-    Ok(())
+    Ok(kept.into_iter().collect())
 }
 
 #[cfg(test)]

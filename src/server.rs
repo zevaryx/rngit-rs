@@ -154,6 +154,9 @@ pub struct Node {
     /// Let forks and mirrors take `http://` sources and sources on this
     /// node's own network, which they don't by default. For labs and tests.
     pub open_sources: bool,
+    /// Have a sync drop the branches and tags its source has dropped. Stock
+    /// rngit never does (its fetch doesn't prune), and neither does this by default.
+    pub prune_synced: bool,
 }
 
 /// Who sent a request: the identity hash they proved on their link, and the

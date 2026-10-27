@@ -34,6 +34,13 @@ pub trait Upstream: Send + Sync + std::fmt::Debug {
     /// branch and tag of `source` and point its HEAD where the source's does.
     /// Give up after `timeout`.
     fn pull(&self, source: &RepoUrl, dest: &Path, timeout: Duration) -> Result<(), String>;
+
+    /// The names of the branches and tags `source` has, for a node that drops
+    /// what a source dropped ([`Node::prune_synced`]). Without it, that node's
+    /// syncs from `source` fail rather than keep what they should drop.
+    fn refs(&self, _source: &RepoUrl, _timeout: Duration) -> Result<Vec<String>, String> {
+        Err("This node can't list what a source has".into())
+    }
 }
 
 /// What a repository follows.
@@ -133,30 +140,43 @@ fn named_source(map: &MapRef, open: bool) -> Result<(String, Source), Refusal> {
     Err(refuse(Status::NotAllowed, "Prohibited source URL: this node forks and mirrors from rns:// and https:// repositories only"))
 }
 
+/// The branches and tags a repository has.
+fn local_refs(repo: &Path) -> Vec<String> {
+    let Ok(repo) = gix::open(repo) else { return Vec::new() };
+    let Ok(platform) = repo.references() else { return Vec::new() };
+    let (Ok(heads), Ok(tags)) = (platform.local_branches(), platform.tags()) else { return Vec::new() };
+    heads.chain(tags).flatten().map(|r| r.name().as_bstr().to_string()).collect()
+}
+
 impl Node {
     fn upstream_or_refuse(&self) -> Result<&dyn Upstream, Refusal> {
         self.upstream.as_deref().ok_or(refuse(Status::NotAllowed, "This node can't fetch from other nodes"))
     }
 
     /// Fetch from `source` into the repository at `dir`, and check it hasn't
-    /// grown past what a repository may.
-    fn pull_into(&self, source: &Source, dir: &Path) -> Result<(), String> {
-        match source {
+    /// grown past what a repository may. With `want_refs`, gives the names of the branches and tags the source has.
+    fn pull_into(&self, source: &Source, dir: &Path, want_refs: bool) -> Result<Option<Vec<String>>, String> {
+        let refs = match source {
             Source::Rns(url) => {
-                self.upstream.as_deref().ok_or("This node can't fetch from other nodes")?.pull(url, dir, self.max_request_time)?
+                let upstream = self.upstream.as_deref().ok_or("This node can't fetch from other nodes")?;
+                // Listed first, so a ref made while fetching isn't taken for one the source dropped.
+                let listed = if want_refs { Some(upstream.refs(url, self.max_request_time)?) } else { None };
+                upstream.pull(url, dir, self.max_request_time)?;
+                listed
             }
             #[cfg(feature = "https")]
             Source::Web(url) => {
                 super::web::check(url, self.open_sources)?;
-                super::web::pull(url, dir, self.max_request_time, self.quotas.max_repo_bytes)?
+                let listed = super::web::pull(url, dir, self.max_request_time, self.quotas.max_repo_bytes)?;
+                want_refs.then_some(listed)
             }
             #[cfg(not(feature = "https"))]
             Source::Web(url) => return Err(format!("This node was built without https:// sources, so can't fetch {url}")),
-        }
+        };
         if dir_size(dir) > self.quotas.max_repo_bytes {
             return Err("The repository is larger than this node keeps".into());
         }
-        Ok(())
+        Ok(refs)
     }
 
     /// `/git/fork` and `/git/mirror`: make a repository from a source, whose
@@ -200,7 +220,7 @@ impl Node {
         let tmp = group_dir.join(format!(".{}-{nanos}.part", kind.word()));
         let made = (|| {
             gix::init_bare(&tmp).map_err(|_| refuse(Status::ServerError, "Failed to initialize repository"))?;
-            self.pull_into(&source, &tmp).map_err(|e| refuse(Status::ServerError, &format!("Failed to fetch from source: {e}")))?;
+            self.pull_into(&source, &tmp, false).map_err(|e| refuse(Status::ServerError, &format!("Failed to fetch from source: {e}")))?;
             write_following(&tmp, Some(kind), &written, now())
                 .map_err(|()| refuse(Status::ServerError, "Failed to configure repository type"))?;
             let allowed = group_dir.join(format!("{repo}.allowed"));
@@ -245,7 +265,17 @@ impl Node {
         let source = Source::parse(&following.source).ok_or("The source isn't an rns:// or https:// repository")?;
         // A fork's HEAD is its keeper's to move; the pull sets it from the source's.
         let head = (following.kind == Kind::Fork).then(|| std::fs::read(dir.join("HEAD")).ok()).flatten();
-        self.pull_into(&source, dir)?;
+        let before = if self.prune_synced { local_refs(dir) } else { Vec::new() };
+        let refs = self.pull_into(&source, dir, self.prune_synced)?;
+        if let Some(refs) = refs {
+            // Only what was here before the pull and the source no longer has.
+            let repo = gix::open(dir).map_err(|_| "Could not open the repository to drop what the source dropped".to_string())?;
+            for name in before.into_iter().filter(|n| !refs.contains(n)) {
+                if let Ok(reference) = repo.find_reference(name.as_str()) {
+                    let _ = reference.delete();
+                }
+            }
+        }
         if let Some(head) = head {
             write_file(&dir.join("HEAD"), &head).map_err(|_| "Could not keep the fork's HEAD".to_string())?;
         }

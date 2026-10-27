@@ -801,6 +801,20 @@ struct Local {
 }
 
 impl rngit::server::Upstream for Local {
+    fn refs(&self, source: &RepoUrl, _timeout: std::time::Duration) -> Result<Vec<String>, String> {
+        let client = Client::new(Direct { node: self.source.clone(), peer: Some(self.peer), key: None });
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+                    let listed = runtime.block_on(client.list(source, false)).map_err(|e| e.to_string())?;
+                    Ok(listed.refs.into_iter().map(|(_, name)| name).collect())
+                })
+                .join()
+                .unwrap_or_else(|_| Err("listing panicked".into()))
+        })
+    }
+
     fn pull(&self, source: &RepoUrl, dest: &std::path::Path, _timeout: std::time::Duration) -> Result<(), String> {
         let client = Client::new(Direct { node: self.source.clone(), peer: Some(self.peer), key: None });
         // On a thread of its own, as the node's callers are not in an async function.
@@ -1074,10 +1088,20 @@ async fn a_mirror_and_a_fork_can_follow_a_repository_served_over_http() {
     for dir in [&mirrored, &forked] {
         assert_eq!(git(dir, &["rev-parse", "later"]), git(&source_repo, &["rev-parse", "later"]));
         assert_eq!(git(dir, &["cat-file", "-t", "v9"]), "commit");
-        assert!(git(dir, &["branch", "--list", "topic"]).is_empty(), "the branch the source dropped");
+        assert!(!git(dir, &["branch", "--list", "topic"]).is_empty(), "stock keeps what the source dropped");
         git(dir, &["fsck", "--strict"]);
     }
     assert_eq!(git(&mirrored, &["symbolic-ref", "HEAD"]), "refs/heads/later");
+
+    // A node told to drop what the source dropped does, for a mirror and a fork.
+    node.prune_synced = true;
+    let pruning = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    pruning.sync(&mirror).await.unwrap();
+    pruning.sync(&fork).await.unwrap();
+    for dir in [&mirrored, &forked] {
+        assert!(git(dir, &["branch", "--list", "topic"]).is_empty(), "the branch the source dropped");
+        assert!(!git(dir, &["branch", "--list", "later"]).is_empty());
+    }
 
     // A source that stops answering fails the sync and leaves the repository as it was.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1121,4 +1145,28 @@ async fn a_source_that_is_larger_than_a_repository_may_be_is_not_kept() {
     let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join("repos/public")).unwrap().flatten().collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[tokio::test]
+async fn a_node_drops_what_an_rns_source_dropped_only_when_told_to() {
+    let (source_tmp, source, _work) = node("r:all");
+    let source_repo = source_tmp.path().join("repos/public/demo.git");
+    let (tmp, mut node) = following(&source);
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let mirror = new_url();
+    client.mirror(&mirror, &source_url()).await.unwrap();
+    let dir = tmp.path().join("repos/public/new.git");
+    git(&source_repo, &["branch", "-D", "topic"]);
+    git(&source_repo, &["tag", "-d", "v1"]);
+    client.sync(&mirror).await.unwrap();
+    assert!(!git(&dir, &["branch", "--list", "topic"]).is_empty());
+    assert!(!git(&dir, &["tag", "--list", "v1"]).is_empty());
+
+    node.prune_synced = true;
+    let pruning = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    pruning.sync(&mirror).await.unwrap();
+    assert!(git(&dir, &["branch", "--list", "topic"]).is_empty());
+    assert!(git(&dir, &["tag", "--list", "v1"]).is_empty());
+    assert!(!git(&dir, &["tag", "--list", "v2"]).is_empty() && !git(&dir, &["branch", "--list", "main"]).is_empty());
+    git(&dir, &["fsck", "--strict"]);
 }
