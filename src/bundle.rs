@@ -223,6 +223,18 @@ pub fn build(repo: &gix::Repository, refname: &str, have: Option<ObjectId>) -> R
 /// reachable from those that we hold ourselves is left out and listed as a
 /// prerequisite.
 pub fn build_many(repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], others: &[ObjectId]) -> Result<Vec<u8>> {
+    build_many_until(repo, wants, others, &NO_INTERRUPT)
+}
+
+/// [`build_many`], giving up with an error soon after `interrupt` is set.
+pub fn build_many_until(
+    repo: &gix::Repository,
+    wants: &[(&str, Option<ObjectId>)],
+    others: &[ObjectId],
+    interrupt: &AtomicBool,
+) -> Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    let stopped = || Error::Git("took too long".into());
     let mut tags = Vec::new();
     let mut tips = Vec::new();
     let mut heads = Vec::new();
@@ -252,8 +264,13 @@ pub fn build_many(repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], ot
     if !haves.is_empty() {
         walk = walk.with_hidden(haves.clone());
     }
-    let mut ids: Vec<ObjectId> =
-        walk.all().map_err(Error::git)?.map(|i| i.map(|i| i.id)).collect::<std::result::Result<_, _>>().map_err(Error::git)?;
+    let mut ids: Vec<ObjectId> = Vec::new();
+    for info in walk.all().map_err(Error::git)? {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(stopped());
+        }
+        ids.push(info.map_err(Error::git)?.id);
+    }
     ids.extend(tags);
 
     let mut db = repo.objects.clone().into_arc().map_err(Error::git)?.into_inner();
@@ -262,7 +279,7 @@ pub fn build_many(repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], ot
         db.clone(),
         Box::new(ids.into_iter().map(Ok)),
         &gix::progress::Discard,
-        &NO_INTERRUPT,
+        interrupt,
         output::count::objects::Options {
             input_object_expansion: output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
             ..Default::default()
@@ -295,6 +312,9 @@ pub fn build_many(repo: &gix::Repository, wants: &[(&str, Option<ObjectId>)], ot
         repo.object_hash(),
     );
     for step in writer {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(stopped());
+        }
         step.map_err(Error::git)?;
     }
     Ok(out)
