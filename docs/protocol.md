@@ -209,6 +209,7 @@ All requests carry `0: "<group>/<repo>.git"` and `"operation": <str>`.
 | `view` | `tag` | `0x00` + msgpack `{tag, hash, created, status, created_by, notes, notes_format, artifacts: [{name, size}], thanks: 0}` |
 | `fetch` | `tag` (or `"latest"`), `artifact` (file name) | RNS Resource with the raw file body |
 | `delete` | `tag` | `0x00` |
+| `latest` | `tag` | `0x00`; makes that release the `latest` in `list`. A missing release gives `0x03 Release not found` |
 | `create` | multi-step, below | |
 
 Missing release gives `0x03 Release not found`. A bad operation gave `0x01 Not allowed` for an unprivileged caller.

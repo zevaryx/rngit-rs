@@ -21,8 +21,13 @@ Repositories (URL is rns://<destination>/<group>/<repo>):
   create URL                    create an empty repository
   fork URL SOURCE               fork SOURCE (an rns, https or ssh URL) on the node
   mirror URL SOURCE             mirror SOURCE on the node
+  push-all URL DIR [force] [prune]   push every branch and tag of the repository in DIR
   delete-ref URL REF            delete a branch or tag on the node (REF is refs/heads/NAME or refs/tags/NAME)
   sync URL                      update a fork or mirror from its source
+A copy on this computer (DIR is a bare repository, REF is refs/heads/NAME or refs/tags/NAME):
+  log DIR REF [COUNT]           the newest commits
+  tree DIR REF [PATH]           the files in a folder
+  show DIR REF PATH             a file's text
 Permissions (TEXT is the new file content, or - to read standard input):
   perms URL [TEXT]              show or replace a repository's permissions
   gperms URL [TEXT]             show or replace the permissions of URL's group
@@ -32,6 +37,8 @@ Releases:
   release-get URL TAG NAME DIR  download one artifact, checked against the node's hash
   release-new URL TAG NOTES FILE...   publish a signed release (the tag must be pushed)
   release-delete URL TAG
+  release-latest URL TAG        make TAG the latest release
+  verify MANIFEST [DIR]         check a downloaded manifest and the files in DIR (default: its folder), offline
 Work documents (SCOPE is active, completed, proposed or all):
   work URL [SCOPE]              list documents
   work-view URL ID [SCOPE]      show one document and check its signature
@@ -78,6 +85,96 @@ fn commit_of_tag(tag: &str) -> Option<String> {
     Some(reference.peel_to_commit().ok()?.id.to_string())
 }
 
+/// Whether `command` works on files here and needs no node or URL.
+pub fn is_local(command: &str) -> bool {
+    matches!(command, "log" | "tree" | "show" | "verify")
+}
+
+/// The commands that read a copy on this computer, which need no node.
+pub fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Result<()> {
+    let arg =
+        |n: usize, what: &str| rest.get(n).map(String::as_str).ok_or_else(|| Error::InvalidInput(format!("{command}: missing {what}")));
+    if command == "verify" {
+        return verify_command(Path::new(arg(0, "MANIFEST")?), rest.get(1).map(Path::new), out);
+    }
+    let (dir, refname) = (Path::new(arg(0, "DIR")?), arg(1, "REF")?);
+    match command {
+        "log" => {
+            let count = match rest.get(2) {
+                Some(n) => n.parse().map_err(|_| Error::InvalidInput(format!("{n:?} is not a count")))?,
+                None => 20,
+            };
+            for commit in crate::local::log(dir, refname, count)? {
+                say(out, format!("{} {} {} {}", commit.id, iso8601(commit.time.max(0) as u64), commit.author, commit.subject))?;
+            }
+        }
+        "tree" => {
+            for entry in crate::local::tree(dir, refname, rest.get(2).map_or("", String::as_str))? {
+                let mark = match entry.kind {
+                    crate::local::EntryKind::Dir => "/",
+                    crate::local::EntryKind::Link => "@",
+                    crate::local::EntryKind::Submodule => "#",
+                    crate::local::EntryKind::File => "",
+                };
+                say(out, format!("{}{mark}{}", entry.name, entry.size.map_or(String::new(), |size| format!("  {size}"))))?;
+            }
+        }
+        _ => {
+            let view = crate::local::file(dir, refname, arg(2, "PATH")?, 1024 * 1024)?;
+            match view.text {
+                Some(text) => write!(out, "{text}").map_err(Error::git)?,
+                None => say(out, format!("binary file, {} bytes", view.size))?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Largest file `verify` reads into memory.
+const MAX_VERIFY_FILE: u64 = 1 << 30;
+
+/// Check a downloaded release with no node: the manifest's signature, then
+/// each file it lists that is in `dir`, against that file's signature.
+fn verify_command(manifest_path: &Path, dir: Option<&Path>, out: &mut dyn Write) -> Result<()> {
+    let read = |path: &Path| -> Result<Vec<u8>> {
+        let size = std::fs::metadata(path).map_err(Error::git)?.len();
+        if size > MAX_VERIFY_FILE {
+            return Err(Error::TooLarge { what: "file", size: size as usize, limit: MAX_VERIFY_FILE as usize });
+        }
+        std::fs::read(path).map_err(Error::git)
+    };
+    let manifest = crate::sign::verify_manifest(&read(manifest_path)?)?;
+    say(
+        out,
+        format!("Valid release manifest for {} {}, signed by {}", manifest.name, manifest.version, hex::encode(manifest.signer.signer)),
+    )?;
+    let dir = dir.or_else(|| manifest_path.parent()).filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let (mut valid, mut checked) = (0, 0);
+    for artifact in &manifest.artifacts {
+        checked += 1;
+        // A name from the manifest is a file in the folder and nothing else.
+        let name = Path::new(&artifact.name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let path = dir.join(&name);
+        if name.is_empty() || name != artifact.name || !path.is_file() {
+            say(out, format!("  File {} from the manifest does not exist here, cannot validate", artifact.name))?;
+            continue;
+        }
+        match crate::sign::verify_rsg(&read(&path)?, &artifact.rsg) {
+            Ok(info) if info.signer == manifest.signer.signer => {
+                valid += 1;
+                say(out, format!("  File {name} validated against the manifest"))?;
+            }
+            Ok(_) => say(out, format!("  File {name} was signed by someone else than the release"))?,
+            Err(_) => say(out, format!("  File {name} does not match the manifest"))?,
+        }
+    }
+    if checked == 0 || valid != checked {
+        say(out, "\nRelease is not valid")?;
+        return Err(Error::Verify("the release is not valid".into()));
+    }
+    say(out, "\nAll files validated")
+}
+
 /// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn iso8601(secs: u64) -> String {
     let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
@@ -109,6 +206,9 @@ pub async fn run<T: Transport>(
     if matches!(command.as_str(), "help" | "-h" | "--help") {
         return say(out, USAGE.trim_end());
     }
+    if is_local(command) {
+        return local_command(command, rest, out);
+    }
     let repo: RepoUrl = arg(0, "URL")?.parse()?;
     match command.as_str() {
         "refs" => {
@@ -127,6 +227,27 @@ pub async fn run<T: Transport>(
             }
             let refs = client.clone_into(&repo, &dir).await?;
             say(out, format!("cloned {} refs into {}", refs.refs.len(), dir.display()))?;
+        }
+        "push-all" => {
+            let dir = PathBuf::from(arg(1, "DIR")?);
+            let flag = |name: &str| rest[2..].iter().any(|a| a == name);
+            if let Some(other) = rest[2..].iter().find(|a| !matches!(a.as_str(), "force" | "prune")) {
+                return Err(Error::InvalidInput(format!("push-all: unknown option {other:?}")));
+            }
+            let report = client.push_all(&repo, &dir, flag("force"), flag("prune")).await?;
+            say(
+                out,
+                format!(
+                    "pushed {}, up to date {}, rejected {}, deleted {}",
+                    report.pushed.len(),
+                    report.up_to_date.len(),
+                    report.rejected.len(),
+                    report.deleted.len()
+                ),
+            )?;
+            for name in &report.rejected {
+                say(out, format!("rejected (not a fast-forward): {name}"))?;
+            }
         }
         "create" => client.create(&repo).await?,
         "fork" => client.fork(&repo, arg(1, "SOURCE")?).await?,
@@ -164,12 +285,22 @@ pub async fn run<T: Transport>(
         }
         "release-get" => {
             let (tag, name, dir) = (arg(1, "TAG")?, arg(2, "NAME")?, Path::new(arg(3, "DIR")?));
-            let (_, files) = client.fetch_verified_release(&repo, tag).await?;
-            let (_, data) =
-                files.iter().find(|(n, _)| n == name).ok_or_else(|| Error::InvalidInput(format!("release has no artifact {name:?}")))?;
+            // The signed manifest can be saved too, to check the files offline later with `verify`.
+            let data = if name == "manifest.rsm" {
+                let rsm = client.fetch_artifact(&repo, tag, name).await?;
+                crate::sign::verify_manifest(&rsm)?;
+                rsm
+            } else {
+                let (_, files) = client.fetch_verified_release(&repo, tag).await?;
+                files
+                    .into_iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, data)| data)
+                    .ok_or_else(|| Error::InvalidInput(format!("release has no artifact {name:?}")))?
+            };
             crate::client::check_artifact_name(name)?;
             std::fs::create_dir_all(dir).map_err(Error::git)?;
-            std::fs::write(dir.join(name), data).map_err(Error::git)?;
+            std::fs::write(dir.join(name), &data).map_err(Error::git)?;
             say(out, format!("saved {} ({} bytes), signature and hash verified", dir.join(name).display(), data.len()))?;
         }
         "release-new" => {
@@ -190,6 +321,7 @@ pub async fn run<T: Transport>(
             client.create_release(&repo, signer, tag, commit.as_deref(), &notes, &files, &iso8601(now), now).await?;
         }
         "release-delete" => client.delete_release(&repo, arg(1, "TAG")?).await?,
+        "release-latest" => client.set_latest_release(&repo, arg(1, "TAG")?).await?,
         "work" => {
             let list = client.work_list(&repo, scope(rest.get(1))?).await?;
             for (label, docs) in [("active", &list.active), ("completed", &list.completed), ("proposed", &list.proposed)] {

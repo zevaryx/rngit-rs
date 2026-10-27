@@ -23,6 +23,9 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         print!("{}", rngit::cli::USAGE);
         return Ok(());
     }
+    if rngit::cli::is_local(&args[0]) {
+        return Ok(rngit::cli::local_command(&args[0], &args[1..], &mut out)?);
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let session = Session::start(Session::settle_time()).await?;
     let result = if args[0] == "nodes" {

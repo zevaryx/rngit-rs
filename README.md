@@ -19,15 +19,17 @@ Requires Rust 1.89 or newer (edition 2024).
 
 | Area | Calls |
 |---|---|
-| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `mirror_into`, `push_from`, `push_from_with`, `push_bundle`, `delete_ref`, `update_ref` |
+| Git | `list`, `fetch_bundle`, `fetch_bundle_with`, `fetch_into`, `fetch_objects`, `clone_into`, `mirror_into`, `push_from`, `push_from_with`, `push_all`, `push_bundle`, `delete_ref`, `update_ref` |
+| Reading a copy | `local::log`, `local::tree`, `local::file` (`rngit log`, `tree`, `show` DIR REF): history, the files of a branch or tag, one file's text, from a repository on this computer such as the one `mirror_into` keeps |
 | Repositories | `create`, `fork`, `mirror`, `sync` |
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
-| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release` |
+| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release`, `set_latest_release` (`release-latest`) |
+| Checking a release offline | `rngit release-get URL TAG manifest.rsm DIR` saves the signed manifest; `rngit verify MANIFEST [DIR]` checks its signature and each file of it found in DIR, with no node |
 | Work documents | `work_list`, `work_create` (create or propose), `work_view`, `work_comment`, `work_edit`, `work_complete`, `work_activate`, `work_delete` |
 | Finding nodes | `discovery::discover` listens for rngit announces |
 
 Fetches only download what the local repository lacks. Pushes send a bundle, or just move the ref
-(`update_ref`) when the node already holds the object. Annotated tags keep their tag object.
+(`update_ref`) when the node already holds the object. Annotated tags keep their tag object. `push_all` (`rngit push-all URL DIR [force] [prune]`) sends every branch and tag of a local repository, such as a mirror, to another node; a branch that isn't a fast-forward is reported and left alone unless forced, and `prune` also deletes what the node has and the copy doesn't.
 
 `/git/delete` deletes a branch or tag (`delete_ref`). No request that deletes a whole repository
 was found, so the library has none. Details are in [`docs/protocol.md`](docs/protocol.md).

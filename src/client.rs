@@ -39,6 +39,19 @@ impl Default for Limits {
     }
 }
 
+/// What [`Client::push_all`] did, by full ref name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushReport {
+    /// Branches and tags sent to the node, or moved there.
+    pub pushed: Vec<String>,
+    /// Refs the node already had at the same object.
+    pub up_to_date: Vec<String>,
+    /// Branches the node has ahead of, or apart from, ours. Left alone unless forced.
+    pub rejected: Vec<String>,
+    /// Refs removed from the node because the copy no longer has them.
+    pub deleted: Vec<String>,
+}
+
 /// The refs a node advertises.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteRefs {
@@ -324,6 +337,55 @@ impl<T: Transport> Client<T> {
         Ok((remote, removed))
     }
 
+    /// Send every branch and tag of the repository at `source` to the node.
+    /// A branch that isn't a fast-forward is listed as rejected and left as
+    /// it is, unless `force` is set. With `prune`, a branch or tag the node
+    /// has and `source` doesn't is deleted there, so the node ends up with
+    /// the same refs as the copy. Stops at the first error, such as missing
+    /// permission; refs already sent stay sent.
+    pub async fn push_all(&self, repo: &RepoUrl, source: &Path, force: bool, prune: bool) -> Result<PushReport> {
+        let remote = self.list(repo, true).await?;
+        let mut local = Vec::new();
+        {
+            let repository = gix::open(source).map_err(Error::git)?;
+            let platform = repository.references().map_err(Error::git)?;
+            for prefix in ["refs/heads/", "refs/tags/"] {
+                for reference in platform.prefixed(prefix).map_err(Error::git)?.flatten() {
+                    let name = reference.name().as_bstr().to_string();
+                    // A name the node would refuse is skipped here rather than failing the whole push.
+                    if check_ref_name(&name).is_ok() {
+                        local.push((bundle::direct_id(&repository, &name)?, name));
+                    }
+                    if local.len() > self.limits.max_refs {
+                        return Err(Error::TooLarge { what: "ref list", size: local.len(), limit: self.limits.max_refs });
+                    }
+                }
+            }
+        }
+        let mut report = PushReport::default();
+        for (id, name) in &local {
+            if remote.get(name) == Some(*id) {
+                report.up_to_date.push(name.clone());
+                continue;
+            }
+            match self.push_from_with(repo, source, name, name, force, &remote).await {
+                Ok(()) => report.pushed.push(name.clone()),
+                Err(Error::NonFastForward) => report.rejected.push(name.clone()),
+                Err(e) => return Err(e),
+            }
+        }
+        if prune {
+            for (_, name) in &remote.refs {
+                let branch_or_tag = name.starts_with("refs/heads/") || name.starts_with("refs/tags/");
+                if branch_or_tag && !local.iter().any(|(_, n)| n == name) {
+                    self.delete_ref(repo, name).await?;
+                    report.deleted.push(name.clone());
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Send a bundle for one ref. See [`Client::push_from`] for the usual route.
     pub async fn push_bundle(&self, repo: &RepoUrl, local_ref: &str, remote_ref: &str, force: bool, bundle: Vec<u8>) -> Result<()> {
         for name in [local_ref, remote_ref] {
@@ -530,6 +592,13 @@ impl<T: Transport> Client<T> {
 
     pub async fn delete_release(&self, repo: &RepoUrl, tag: &str) -> Result<()> {
         self.packet("/mgmt/release", Self::release_request(repo, "delete").put("tag", tag)).await.map(drop)
+    }
+
+    /// Make `tag` the release the node calls the latest. The release has to
+    /// exist; the node answers `0x03` if it doesn't.
+    pub async fn set_latest_release(&self, repo: &RepoUrl, tag: &str) -> Result<()> {
+        check_artifact_name(tag)?;
+        self.packet("/mgmt/release", Self::release_request(repo, "latest").put("tag", tag)).await.map(drop)
     }
 
     /// Publish a release: the tag must already be pushed. Signs each file,

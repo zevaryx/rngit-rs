@@ -180,6 +180,10 @@ async fn release_commands() {
     // Without signed artifacts on the node, a download can't be verified.
     let (result, _) = cli(&client, &["release-get", URL, "v1", "a.bin", tmp.path().to_str().unwrap()], "").await;
     assert!(result.is_err());
+    // The manifest is saved only if its signature checks out.
+    let (result, _) = cli(&client, &["release-get", URL, "v1", "manifest.rsm", tmp.path().to_str().unwrap()], "").await;
+    assert!(result.is_err());
+    assert!(!tmp.path().join("manifest.rsm").exists());
 }
 
 #[tokio::test]
@@ -236,4 +240,140 @@ async fn bad_arguments_are_errors() {
         assert!(text.starts_with("usage: rngit"));
     }
     assert_eq!(client.transport().requests().len(), before, "help never touches the network");
+}
+
+#[tokio::test]
+async fn push_all_reports_what_it_did() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, server) = (tmp.path().join("work"), tmp.path().join("server.git"));
+    work_repo(&work, 2);
+    git(&work, &["tag", "v1"]);
+    bare_repo(&server);
+    let client = Client::new(canned(server.clone()));
+    let dir = work.to_str().unwrap();
+
+    let (result, text) = cli(&client, &["push-all", URL, dir], "").await;
+    result.unwrap();
+    assert_eq!(text, "pushed 2, up to date 0, rejected 0, deleted 0\n");
+    let (result, text) = cli(&client, &["push-all", URL, dir, "force", "prune"], "").await;
+    result.unwrap();
+    assert_eq!(text, "pushed 0, up to date 2, rejected 0, deleted 0\n");
+    let (result, _) = cli(&client, &["push-all", URL, dir, "everything"], "").await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+    let (result, _) = cli(&client, &["push-all", URL], "").await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn a_copy_is_read_with_log_tree_and_show() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, copy) = (tmp.path().join("work"), tmp.path().join("copy.git"));
+    work_repo(&work, 2);
+    std::fs::write(work.join("bin"), [0u8, 159, 146]).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "binary"]);
+    bare_repo(&copy);
+    git(&work, &["push", "-q", copy.to_str().unwrap(), "main"]);
+    let client = Client::new(canned(copy.clone()));
+    let dir = copy.to_str().unwrap();
+
+    let (result, text) = cli(&client, &["log", dir, "refs/heads/main", "2"], "").await;
+    result.unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() == 2 && lines[0].ends_with(" binary") && lines[1].ends_with(" commit 1"), "{text}");
+    let (result, text) = cli(&client, &["tree", dir, "refs/heads/main"], "").await;
+    result.unwrap();
+    assert!(text.contains("file0.txt  ") && text.contains("bin  3"), "{text}");
+    let (result, text) = cli(&client, &["show", dir, "refs/heads/main", "file0.txt"], "").await;
+    result.unwrap();
+    assert!(text.contains("content 0"), "{text}");
+    let (result, text) = cli(&client, &["show", dir, "refs/heads/main", "bin"], "").await;
+    result.unwrap();
+    assert_eq!(text, "binary file, 3 bytes\n");
+    for args in [&["log", dir][..], &["log", dir, "refs/heads/main", "many"], &["show", dir, "refs/heads/main"], &["tree", dir, "main"]] {
+        let (result, _) = cli(&client, args, "").await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))), "{args:?}");
+    }
+}
+
+#[tokio::test]
+async fn release_latest_is_sent_and_a_bad_tag_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let client = Client::new(canned(tmp.path().join("server.git")));
+    let (result, _) = cli(&client, &["release-latest", URL, "v1"], "").await;
+    result.unwrap();
+    let (path, request) = last(&client);
+    assert_eq!(path, "/mgmt/release");
+    assert_eq!(field(&request, "operation").and_then(|v| v.as_str()), Some("latest"));
+    assert_eq!(field(&request, "tag").and_then(|v| v.as_str()), Some("v1"));
+    let before = client.transport().requests().len();
+    for bad in ["a/b", "..", ""] {
+        let (result, _) = cli(&client, &["release-latest", URL, bad], "").await;
+        assert!(matches!(result, Err(Error::InvalidInput(_))), "{bad:?}");
+    }
+    let (result, _) = cli(&client, &["release-latest", URL], "").await;
+    assert!(matches!(result, Err(Error::InvalidInput(_))));
+    assert_eq!(client.transport().requests().len(), before);
+}
+
+#[tokio::test]
+async fn a_downloaded_release_is_verified_without_a_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("rel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = Key::new();
+    let files = [("app.bin", b"the app".to_vec()), ("notes.txt", b"read me".to_vec())];
+    let artifacts: Vec<(String, Vec<u8>)> =
+        files.iter().map(|(name, data)| (name.to_string(), sign::make_rsg(&key, data, 10).unwrap())).collect();
+    let rsm = sign::make_rsm(
+        &key,
+        &sign::ManifestInput {
+            name: "demo.git",
+            version: "v1",
+            released: "2026-01-01T00:00:00Z",
+            origin: [1; 16],
+            path: "public/demo.git",
+            commit: "",
+            message: b"notes",
+            artifacts: &artifacts,
+        },
+        10,
+    )
+    .unwrap();
+    std::fs::write(dir.join("demo.git_v1.rsm"), &rsm).unwrap();
+    for (name, data) in &files {
+        std::fs::write(dir.join(name), data).unwrap();
+    }
+    let client = Client::new(canned(tmp.path().join("server.git")));
+    let manifest = dir.join("demo.git_v1.rsm");
+    let manifest = manifest.to_str().unwrap();
+
+    let (result, text) = cli(&client, &["verify", manifest], "").await;
+    result.unwrap();
+    assert!(
+        text.contains("File app.bin validated") && text.contains("File notes.txt validated") && text.ends_with("All files validated\n"),
+        "{text}"
+    );
+    assert!(client.transport().requests().is_empty(), "no node was asked");
+
+    // A file that changed, one that is missing and a manifest that was changed.
+    std::fs::write(dir.join("app.bin"), b"tampered").unwrap();
+    std::fs::remove_file(dir.join("notes.txt")).unwrap();
+    let (result, text) = cli(&client, &["verify", manifest], "").await;
+    assert!(matches!(result, Err(Error::Verify(_))));
+    assert!(text.contains("app.bin does not match") && text.contains("notes.txt from the manifest does not exist"), "{text}");
+    // The files can be in another folder than the manifest.
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("app.bin"), b"the app").unwrap();
+    std::fs::write(elsewhere.join("notes.txt"), b"read me").unwrap();
+    let (result, _) = cli(&client, &["verify", manifest, elsewhere.to_str().unwrap()], "").await;
+    result.unwrap();
+    let mut bad = rsm.clone();
+    bad[100] ^= 1;
+    std::fs::write(dir.join("bad.rsm"), bad).unwrap();
+    let (result, _) = cli(&client, &["verify", dir.join("bad.rsm").to_str().unwrap()], "").await;
+    assert!(matches!(result, Err(Error::Verify(_))));
+    let (result, _) = cli(&client, &["verify", "/no/such/file.rsm"], "").await;
+    assert!(result.is_err());
 }

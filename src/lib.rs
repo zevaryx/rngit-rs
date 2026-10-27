@@ -11,6 +11,7 @@ pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod helper;
+pub mod local;
 #[cfg(feature = "reticulum")]
 pub mod rns;
 #[cfg(feature = "reticulum")]
@@ -20,7 +21,7 @@ pub mod transport;
 pub mod url;
 pub mod wire;
 
-pub use client::{Client, Limits, RemoteRefs, Want};
+pub use client::{Client, Limits, PushReport, RemoteRefs, Want};
 pub use error::{Error, Result, Status};
 pub use transport::{Response, Transport};
 pub use url::RepoUrl;
