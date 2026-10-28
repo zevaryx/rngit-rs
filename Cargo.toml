@@ -14,7 +14,7 @@ default = ["reticulum", "https"]
 reticulum = ["dep:rns-runtime", "dep:rns-identity", "dep:tokio"]
 # Forks and mirrors of https:// repositories (a node's own fetching, in-process
 # with gix; nothing is run). Pulls in an HTTP client and TLS.
-https = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwest-rust-tls"]
+https = ["gix/blocking-network-client", "gix/blocking-http-transport-reqwest-rust-tls", "dep:reqwest", "dep:webpki-root-certs"]
 
 [[bin]]
 name = "git-remote-rns"
@@ -39,6 +39,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 rns-runtime = { git = "https://github.com/zevaryx/rsReticulum", rev = "6fb0dee95622c49c517b7e8a6f42e4a01b0eb3cf", optional = true }
 rns-identity = { git = "https://github.com/zevaryx/rsReticulum", rev = "6fb0dee95622c49c517b7e8a6f42e4a01b0eb3cf", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"], optional = true }
+# For https sources: gix's HTTP client, to add the bundled root certificates.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
+webpki-root-certs = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

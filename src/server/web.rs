@@ -100,10 +100,11 @@ pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64)
             }
         });
         let result = (|| {
-            let connection = remote.connect(gix::remote::Direction::Fetch).map_err(|e| e.to_string())?;
-            let prepared = connection.prepare_fetch(gix::progress::Discard, Default::default()).map_err(|e| e.to_string())?;
+            let connection =
+                remote.connect(gix::remote::Direction::Fetch).map_err(|e| e.to_string())?.with_transport_options(options(&repo, source)?);
+            let prepared = connection.prepare_fetch(gix::progress::Discard, Default::default()).map_err(|e| why(&e))?;
             let refs = prepared.ref_map().remote_refs.clone();
-            prepared.receive(gix::progress::Discard, &stop).map_err(|e| e.to_string())?;
+            prepared.receive(gix::progress::Discard, &stop).map_err(|e| why(&e))?;
             Ok::<_, String>(refs)
         })();
         done.store(true, Ordering::Relaxed);
@@ -133,9 +134,73 @@ pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64)
     Ok(kept.into_iter().collect())
 }
 
+/// gix's HTTP options for `source`, trusting the root certificates rngit comes
+/// with as well as the system's: a small container image has no store of its
+/// own, and without one no https source could be reached.
+fn options(repo: &gix::Repository, source: &str) -> Result<Box<dyn std::any::Any>, String> {
+    use gix::protocol::transport::client::blocking_io::http;
+    use std::sync::{Arc, Mutex};
+
+    let configured = repo.transport_options(source, None).map_err(|e| e.to_string())?;
+    let mut options = configured.and_then(|o| o.downcast::<http::Options>().ok()).map(|o| *o).unwrap_or_default();
+    let backend = http::reqwest::Options {
+        configure_client: Some(Box::new(|builder| Ok(builder.tls_certs_merge(bundled_roots())))),
+        configure_request: None,
+    };
+    options.backend = Some(Arc::new(Mutex::new(backend)));
+    Ok(Box::new(options))
+}
+
+/// An error and the innermost reason for it: gix's own message is often only
+/// "Transport handshake failed".
+fn why(e: &dyn std::error::Error) -> String {
+    let mut root = e;
+    while let Some(next) = root.source() {
+        root = next;
+    }
+    let (said, reason) = (e.to_string(), root.to_string());
+    if said == reason { said } else { format!("{said}: {reason}") }
+}
+
+fn bundled_roots() -> Vec<reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().filter_map(|der| reqwest::Certificate::from_der(der).ok()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bundled_roots_are_trusted_whatever_the_system_has() {
+        assert_eq!(bundled_roots().len(), webpki_root_certs::TLS_SERVER_ROOT_CERTS.len());
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(dir.path()).unwrap();
+        let options = options(&repo, "https://example.com/a/b.git").unwrap();
+        let options = options.downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>().unwrap();
+        let backend = options.backend.as_ref().unwrap().lock().unwrap();
+        let backend = backend.downcast_ref::<gix::protocol::transport::client::blocking_io::http::reqwest::Options>().unwrap();
+        assert!(backend.configure_client.is_some());
+    }
+
+    #[test]
+    fn a_failure_says_why() {
+        let e = std::io::Error::other(std::io::Error::other("invalid peer certificate: UnknownIssuer"));
+        assert_eq!(why(&e), "invalid peer certificate: UnknownIssuer");
+        #[derive(Debug)]
+        struct Handshake(std::io::Error);
+        impl std::fmt::Display for Handshake {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("Transport handshake failed")
+            }
+        }
+        impl std::error::Error for Handshake {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Handshake(std::io::Error::other("No CA certificates were loaded from the system"));
+        assert_eq!(why(&e), "Transport handshake failed: No CA certificates were loaded from the system");
+    }
 
     #[test]
     fn only_public_addresses_count() {

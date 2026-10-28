@@ -2494,6 +2494,7 @@ dependencies = [
  "gix-odb",
  "gix-pack",
  "hex",
+ "reqwest",
  "rmpv",
  "rns-identity",
  "rns-runtime",
@@ -2502,6 +2503,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "webpki-root-certs",
 ]
 
 [[package]]
