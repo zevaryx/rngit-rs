@@ -43,38 +43,40 @@ pub trait Upstream: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// What a repository follows.
+/// How a repository follows its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub enum Follows {
     Fork,
     Mirror,
 }
 
-impl Kind {
+impl Follows {
     fn word(self) -> &'static str {
         match self {
-            Kind::Fork => "fork",
-            Kind::Mirror => "mirror",
+            Follows::Fork => "fork",
+            Follows::Mirror => "mirror",
         }
     }
 }
 
-/// A repository that follows another: how, what and when it last did.
-struct Following {
-    kind: Kind,
-    source: String,
-    synced: u64,
+/// A repository that follows another: how, what and when it last did
+/// (seconds since 1970; 0 if never).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Following {
+    pub kind: Follows,
+    pub source: String,
+    pub synced: u64,
 }
 
 fn config_path(repo: &Path) -> PathBuf {
     repo.join("config")
 }
 
-fn read_following(repo: &Path) -> Option<Following> {
+pub(super) fn read_following(repo: &Path) -> Option<Following> {
     let config = gix::config::File::from_path_no_includes(config_path(repo), gix::config::Source::Local).ok()?;
     let kind = match config.string_by("repository", Some("rngit".into()), "type")?.to_string().as_str() {
-        "fork" => Kind::Fork,
-        "mirror" => Kind::Mirror,
+        "fork" => Follows::Fork,
+        "mirror" => Follows::Mirror,
         _ => return None,
     };
     let source = config.string_by("repository", Some("rngit.upstream".into()), "source")?.to_string();
@@ -84,7 +86,7 @@ fn read_following(repo: &Path) -> Option<Following> {
 }
 
 /// Write what a repository follows, and when it did.
-fn write_following(repo: &Path, kind: Option<Kind>, source: &str, synced: u64) -> Result<(), ()> {
+fn write_following(repo: &Path, kind: Option<Follows>, source: &str, synced: u64) -> Result<(), ()> {
     let mut config = gix::config::File::from_path_no_includes(config_path(repo), gix::config::Source::Local).map_err(drop)?;
     let mut set = |subsection: &str, key: &str, value: &str| {
         config.set_raw_value_by("repository", Some(subsection.into()), key, value).map(drop).map_err(drop)
@@ -98,7 +100,7 @@ fn write_following(repo: &Path, kind: Option<Kind>, source: &str, synced: u64) -
 }
 
 /// Where a fork or mirror gets its commits.
-enum Source {
+pub(super) enum Source {
     /// A repository on an rngit node, fetched by the node's [`Upstream`].
     Rns(RepoUrl),
     /// An `https://` repository, fetched in this process.
@@ -121,19 +123,24 @@ fn named_source(map: &MapRef, open: bool) -> Result<(String, Source), Refusal> {
         Some(Value::String(s)) => s.as_str().unwrap_or_default().to_string(),
         Some(_) => return Err(refuse(Status::BadRequest, "Invalid source URL")),
     };
+    checked_source(&source, open).map(|parsed| (source, parsed))
+}
+
+/// A source as written, if it is one this node fetches from.
+pub(super) fn checked_source(source: &str, open: bool) -> Result<Source, Refusal> {
     if source.is_empty() {
         return Err(refuse(Status::BadRequest, "No source specified"));
     }
     let lower = source.to_ascii_lowercase();
     if lower.starts_with("rns://") {
         let url = source.parse().map_err(|_| refuse(Status::BadRequest, "Invalid source URL"))?;
-        return Ok((source, Source::Rns(url)));
+        return Ok(Source::Rns(url));
     }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         #[cfg(feature = "https")]
         {
-            super::web::check(&source, open).map_err(|e| refuse(Status::NotAllowed, &e))?;
-            return Ok((source.clone(), Source::Web(source)));
+            super::web::check(source, open).map_err(|e| refuse(Status::NotAllowed, &e))?;
+            return Ok(Source::Web(source.to_string()));
         }
     }
     let _ = open;
@@ -149,7 +156,7 @@ fn local_refs(repo: &Path) -> Vec<String> {
 }
 
 impl Node {
-    fn upstream_or_refuse(&self) -> Result<&dyn Upstream, Refusal> {
+    pub(super) fn upstream_or_refuse(&self) -> Result<&dyn Upstream, Refusal> {
         self.upstream.as_deref().ok_or(refuse(Status::NotAllowed, "This node can't fetch from other nodes"))
     }
 
@@ -181,7 +188,7 @@ impl Node {
 
     /// `/git/fork` and `/git/mirror`: make a repository from a source, whose
     /// maker is its administrator.
-    pub(super) fn fork_or_mirror(&self, request: &Value, map: &MapRef, peer: &[u8; 16], kind: Kind) -> Result<Response, Refusal> {
+    pub(super) fn fork_or_mirror(&self, request: &Value, map: &MapRef, peer: &[u8; 16], kind: Follows) -> Result<Response, Refusal> {
         if *peer == super::NULL_IDENT {
             return Err(refuse(Status::NotAllowed, "Not identified"));
         }
@@ -207,7 +214,22 @@ impl Node {
                 refuse(Status::NotFound, "Not found")
             });
         }
-        let kept = std::fs::read_dir(&group_dir).map_or(0, |entries| entries.flatten().filter(|e| e.path().is_dir()).count());
+        self.make_following(&group_dir, repo, &written, &source, kind, Some(peer)).map(|()| ack())
+    }
+
+    /// Make `repo` in `group_dir` from a source, with `admin` as its
+    /// administrator if there is one. Shared by requests and the owner.
+    pub(super) fn make_following(
+        &self,
+        group_dir: &Path,
+        repo: &str,
+        written: &str,
+        source: &Source,
+        kind: Follows,
+        admin: Option<&[u8; 16]>,
+    ) -> Result<(), Refusal> {
+        let final_dir = group_dir.join(repo);
+        let kept = std::fs::read_dir(group_dir).map_or(0, |entries| entries.flatten().filter(|e| e.path().is_dir()).count());
         if kept >= self.quotas.max_repos_per_group {
             return Err(refuse(Status::ServerError, "Too many repositories in this group"));
         }
@@ -220,14 +242,18 @@ impl Node {
         let tmp = group_dir.join(format!(".{}-{nanos}.part", kind.word()));
         let made = (|| {
             gix::init_bare(&tmp).map_err(|_| refuse(Status::ServerError, "Failed to initialize repository"))?;
-            self.pull_into(&source, &tmp, false).map_err(|e| refuse(Status::ServerError, &format!("Failed to fetch from source: {e}")))?;
-            write_following(&tmp, Some(kind), &written, now())
+            self.pull_into(source, &tmp, false).map_err(|e| refuse(Status::ServerError, &format!("Failed to fetch from source: {e}")))?;
+            write_following(&tmp, Some(kind), written, now())
                 .map_err(|()| refuse(Status::ServerError, "Failed to configure repository type"))?;
             let allowed = group_dir.join(format!("{repo}.allowed"));
-            write_file(&allowed, format!("adm:{}", hex::encode(peer)).as_bytes())
-                .map_err(|_| refuse(Status::ServerError, "Could not initialize repository"))?;
+            if let Some(admin) = admin {
+                write_file(&allowed, format!("adm:{}", hex::encode(admin)).as_bytes())
+                    .map_err(|_| refuse(Status::ServerError, "Could not initialize repository"))?;
+            }
             if final_dir.exists() || std::fs::rename(&tmp, &final_dir).is_err() {
-                let _ = std::fs::remove_file(&allowed);
+                if admin.is_some() {
+                    let _ = std::fs::remove_file(&allowed);
+                }
                 return Err(refuse(Status::ServerError, "Could not write repository"));
             }
             Ok(())
@@ -235,7 +261,7 @@ impl Node {
         if made.is_err() {
             let _ = std::fs::remove_dir_all(&tmp);
         }
-        made.map(|()| ack())
+        made
     }
 
     /// `/git/sync`: follow the source of a fork or mirror again.
@@ -256,15 +282,15 @@ impl Node {
         if matches!(Source::parse(&following.source), Some(Source::Rns(_))) {
             self.upstream_or_refuse()?;
         }
-        self.follow(&dir, &following)
-            .map(|()| ack())
-            .map_err(|_| refuse(Status::ServerError, if following.kind == Kind::Fork { "Fork sync failed" } else { "Mirror sync failed" }))
+        self.follow(&dir, &following).map(|()| ack()).map_err(|_| {
+            refuse(Status::ServerError, if following.kind == Follows::Fork { "Fork sync failed" } else { "Mirror sync failed" })
+        })
     }
 
-    fn follow(&self, dir: &Path, following: &Following) -> Result<(), String> {
+    pub(super) fn follow(&self, dir: &Path, following: &Following) -> Result<(), String> {
         let source = Source::parse(&following.source).ok_or("The source isn't an rns:// or https:// repository")?;
         // A fork's HEAD is its keeper's to move; the pull sets it from the source's.
-        let head = (following.kind == Kind::Fork).then(|| std::fs::read(dir.join("HEAD")).ok()).flatten();
+        let head = (following.kind == Follows::Fork).then(|| std::fs::read(dir.join("HEAD")).ok()).flatten();
         let before = if self.prune_synced { local_refs(dir) } else { Vec::new() };
         let refs = self.pull_into(&source, dir, self.prune_synced)?;
         if let Some(refs) = refs {
@@ -294,7 +320,7 @@ impl Node {
                 if split_repo_path(&format!("{}/{name}", group.file_name().to_string_lossy())).is_none() {
                     continue;
                 }
-                let Some(following) = read_following(&repo.path()).filter(|f| f.kind == Kind::Mirror) else { continue };
+                let Some(following) = read_following(&repo.path()).filter(|f| f.kind == Follows::Mirror) else { continue };
                 if now().saturating_sub(following.synced) >= older_than.as_secs() && self.follow(&repo.path(), &following).is_ok() {
                     synced += 1;
                 }

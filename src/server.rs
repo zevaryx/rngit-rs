@@ -25,9 +25,11 @@ use crate::error::Status;
 use crate::transport::Response;
 use crate::wire::{self, MapRef};
 
-pub use upstream::Upstream;
+pub use owner::Hosted;
+pub use upstream::{Following, Follows, Upstream};
 
 mod access;
+mod owner;
 mod perms;
 mod releases;
 mod support;
@@ -309,8 +311,8 @@ impl Node {
                 "/git/create" => self.create(&request, &peer),
                 "/git/delete" => self.delete_ref(&request, &map, &peer),
                 "/mgmt/release" => self.release(&request, &map, &peer),
-                "/git/fork" => self.fork_or_mirror(&request, &map, &peer, upstream::Kind::Fork),
-                "/git/mirror" => self.fork_or_mirror(&request, &map, &peer, upstream::Kind::Mirror),
+                "/git/fork" => self.fork_or_mirror(&request, &map, &peer, upstream::Follows::Fork),
+                "/git/mirror" => self.fork_or_mirror(&request, &map, &peer, upstream::Follows::Mirror),
                 "/git/sync" => self.sync(&request, &peer),
                 "/mgmt/perms" => self.perms(&request, &map, &peer),
                 "/mgmt/work" => self.work(&request, &map, &peer, key.as_ref()),

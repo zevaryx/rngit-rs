@@ -2,7 +2,7 @@ mod common;
 
 use common::*;
 use rngit::error::{Error, Status};
-use rngit::server::{NULL_IDENT, Node, Rule, Sender, Who};
+use rngit::server::{Follows, NULL_IDENT, Node, Rule, Sender, Who};
 use rngit::{Client, RepoUrl, Response, Transport};
 
 const ME: [u8; 16] = [7; 16];
@@ -1169,4 +1169,69 @@ async fn a_node_drops_what_an_rns_source_dropped_only_when_told_to() {
     assert!(git(&dir, &["tag", "--list", "v1"]).is_empty());
     assert!(!git(&dir, &["tag", "--list", "v2"]).is_empty() && !git(&dir, &["branch", "--list", "main"]).is_empty());
     git(&dir, &["fsck", "--strict"]);
+}
+
+#[tokio::test]
+async fn the_owner_manages_what_the_node_hosts_whatever_the_rules() {
+    let (source_tmp, source, _work) = node("r:all");
+    let source_repo = source_tmp.path().join("repos/public/demo.git");
+    let (tmp, mut node) = following(&source);
+    // Nobody may make anything; the owner still can.
+    node.default_rules = Rule::parse("r:all");
+    let repos = tmp.path().join("repos");
+
+    node.make_repository("team", "empty.git", None).unwrap();
+    assert_eq!(git(&repos.join("team/empty.git"), &["symbolic-ref", "HEAD"]), "refs/heads/master");
+    assert!(!repos.join("team/empty.git.allowed").exists());
+    node.follow_source("mirrors", "demo.git", &format!(" {} ", source_url()), Follows::Mirror, Some(&ME)).unwrap();
+    let mirrored = repos.join("mirrors/demo.git");
+    assert_eq!(git(&mirrored, &["rev-parse", "main"]), git(&source_repo, &["rev-parse", "main"]));
+    assert_eq!(std::fs::read_to_string(repos.join("mirrors/demo.git.allowed")).unwrap(), format!("adm:{}", hex::encode(ME)));
+
+    assert_eq!(node.groups(), ["mirrors", "public", "team"]);
+    let hosted = node.hosted();
+    let names: Vec<_> = hosted.iter().map(|h| format!("{}/{}", h.group, h.name)).collect();
+    assert_eq!(names, ["mirrors/demo.git", "team/empty.git"]);
+    let following = hosted[0].following.as_ref().unwrap();
+    assert_eq!((following.kind, following.source.as_str()), (Follows::Mirror, source_url().as_str()));
+    assert!(following.synced > 1_000_000_000 && hosted[0].bytes > 0 && hosted[1].following.is_none());
+
+    // Syncing follows the source; a repository that follows nothing can't.
+    git(&source_repo, &["branch", "later", "main"]);
+    node.sync_repository("mirrors", "demo.git").unwrap();
+    assert!(git(&mirrored, &["branch", "--list", "later"]).contains("later"));
+    assert!(node.sync_repository("team", "empty.git").unwrap_err().contains("neither"));
+
+    // Rules are checked as a request's are; empty removes them.
+    node.set_rules("team", Some("empty.git"), "r:all\nadm:none").unwrap();
+    assert_eq!(node.rules("team", Some("empty.git")).unwrap(), "r:all\nadm:none");
+    assert!(node.set_rules("team", Some("empty.git"), "r:all, w:all").unwrap_err().contains("line 1"));
+    assert!(node.set_rules("team", Some("gone.git"), "r:all").is_err());
+    node.set_rules("team", None, "c:all").unwrap();
+    assert_eq!(std::fs::read_to_string(repos.join("team.allowed")).unwrap(), "c:all");
+    node.set_rules("team", None, " ").unwrap();
+    assert!(!repos.join("team.allowed").exists() && node.rules("team", None).unwrap().is_empty());
+
+    // Renaming takes what sits beside it along; it never overwrites.
+    std::fs::create_dir_all(repos.join("mirrors/demo.git.releases/v1")).unwrap();
+    assert!(node.rename_repository("mirrors", "demo.git", "team", "empty.git").unwrap_err().contains("already there"));
+    node.rename_repository("mirrors", "demo.git", "kept", "demo2.git").unwrap();
+    assert!(repos.join("kept/demo2.git.releases/v1").is_dir() && repos.join("kept/demo2.git.allowed").is_file());
+    assert!(!repos.join("mirrors/demo.git").exists() && !repos.join("mirrors/demo.git.allowed").exists());
+    node.sync_repository("kept", "demo2.git").unwrap();
+
+    // Deleting takes them too.
+    node.delete_repository("kept", "demo2.git").unwrap();
+    assert_eq!(std::fs::read_dir(repos.join("kept")).unwrap().count(), 0);
+    assert!(node.delete_repository("kept", "demo2.git").is_err());
+
+    // Names that aren't plain, and sources it doesn't take, are refused before anything is made.
+    for (group, repo) in [("..", "x.git"), ("team", "../x.git"), ("team", "x"), (".hidden", "x.git")] {
+        assert!(node.make_repository(group, repo, None).is_err(), "{group}/{repo}");
+        assert!(node.delete_repository(group, repo).is_err(), "{group}/{repo}");
+    }
+    assert!(node.make_group("a/b").is_err());
+    assert!(node.follow_source("team", "ssh.git", "ssh://example.com/x.git", Follows::Fork, None).unwrap_err().contains("Prohibited"));
+    assert!(node.follow_source("team", "none.git", "", Follows::Fork, None).is_err());
+    assert!(!repos.join("team/ssh.git").exists());
 }
