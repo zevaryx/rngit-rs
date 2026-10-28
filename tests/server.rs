@@ -1195,6 +1195,15 @@ async fn the_owner_manages_what_the_node_hosts_whatever_the_rules() {
     let following = hosted[0].following.as_ref().unwrap();
     assert_eq!((following.kind, following.source.as_str()), (Follows::Mirror, source_url().as_str()));
     assert!(following.synced > 1_000_000_000 && hosted[0].bytes > 0 && hosted[1].following.is_none());
+    // Whether anyone may clone each, as the rules stand.
+    assert!(hosted.iter().all(|h| h.open));
+    node.set_rules("mirrors", Some("demo.git"), &format!("r:{}", hex::encode(ME))).unwrap();
+    node.default_rules.clear();
+    let open: Vec<_> = node.hosted().iter().map(|h| h.open).collect();
+    assert_eq!(open, [false, false]);
+    node.set_rules("team", None, "r:all").unwrap();
+    let open: Vec<_> = node.hosted().iter().map(|h| h.open).collect();
+    assert_eq!(open, [false, true]);
 
     // Syncing follows the source; a repository that follows nothing can't.
     git(&source_repo, &["branch", "later", "main"]);

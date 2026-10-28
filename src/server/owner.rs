@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::support::{check_rules, write_file};
 use super::upstream::{checked_source, read_following};
-use super::{Following, Follows, MAX_RULES_BYTES, Node, dir_size, split_repo_path};
+use super::{Following, Follows, MAX_RULES_BYTES, NULL_IDENT, Node, Perm, dir_size, split_repo_path};
 
 /// Most repositories listed, so a huge folder can't take long.
 const MAX_LISTED: usize = 10_000;
@@ -22,6 +22,9 @@ pub struct Hosted {
     pub following: Option<Following>,
     /// Bytes it takes on disk, with its releases.
     pub bytes: u64,
+    /// Whether anyone may read (clone) it. If not, only those its rules or its
+    /// group's name may, and to anyone else it isn't there.
+    pub open: bool,
 }
 
 /// Whether a group's name is one a request could name.
@@ -86,7 +89,8 @@ impl Node {
                 let dir = self.root.join(&group).join(&name);
                 let releases = self.root.join(&group).join(format!("{name}.releases"));
                 let bytes = dir_size(&dir).saturating_add(dir_size(&releases));
-                out.push(Hosted { group: group.clone(), name, following: read_following(&dir), bytes });
+                let open = self.allowed(&group, &name, &NULL_IDENT, Perm::Read);
+                out.push(Hosted { group: group.clone(), name, following: read_following(&dir), bytes, open });
             }
         }
         out
