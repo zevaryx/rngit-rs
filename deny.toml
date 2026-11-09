@@ -31,11 +31,47 @@ allow = [
   'LGPL-3.0-or-later',
   'GPL-3.0-or-later',
   'AGPL-3.0-or-later',
+  'LicenseRef-Reticulum',
   'bzip2-1.0.6',
   'Unicode-3.0',
 ]
 unused-allowed-license = "allow"
 confidence-threshold = 0.8
+
+# rsReticulum's Reticulum License, which has no SPDX identifier. A changed
+# license file stops matching, and the crate is checked again.
+[[licenses.clarify]]
+crate = "rns-crypto"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-identity"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-interface"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-link"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-protocol"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-runtime"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-transport"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
+[[licenses.clarify]]
+crate = "rns-wire"
+expression = "LicenseRef-Reticulum"
+license-files = [{ path = "../../LICENSE", hash = 0xf930d1af }]
 
 [bans]
 multiple-versions = "warn"
