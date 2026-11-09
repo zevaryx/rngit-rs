@@ -134,4 +134,6 @@ CI runs these on Linux, macOS and Windows. Line coverage is kept at or above 85%
 
 ## Licence
 
-AGPL-3.0-or-later, the same as rsReticulum, which it links against.
+The [Reticulum License](LICENSE), the same as rsReticulum, which it links against. It allows
+use, changes and redistribution, except in systems built to harm people, and in creating or
+training AI or machine-learning models.
