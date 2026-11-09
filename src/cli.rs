@@ -24,8 +24,9 @@ Repositories (URL is rns://<destination>/<group>/<repo>):
   push-all URL DIR [force] [prune]   push every branch and tag of the repository in DIR
   delete-ref URL REF            delete a branch or tag on the node (REF is refs/heads/NAME or refs/tags/NAME)
   sync URL                      update a fork or mirror from its source
-A copy on this computer (DIR is a bare repository, REF is refs/heads/NAME or refs/tags/NAME):
-  log DIR REF [COUNT]           the newest commits
+A copy on this computer (DIR is a bare repository, REF is refs/heads/NAME, refs/tags/NAME or a commit's hash):
+  log DIR REF [COUNT] [SKIP]    the newest commits, after the newest SKIP
+  commit DIR REF                one commit: its message and the files it changed
   tree DIR REF [PATH]           the files in a folder
   show DIR REF PATH             a file's text
 Permissions (TEXT is the new file content, or - to read standard input):
@@ -89,7 +90,7 @@ fn commit_of_tag(tag: &str) -> Option<String> {
 
 /// Whether `command` works on files here and needs no node or URL.
 pub fn is_local(command: &str) -> bool {
-    matches!(command, "log" | "tree" | "show" | "verify")
+    matches!(command, "log" | "commit" | "tree" | "show" | "verify")
 }
 
 /// The commands that read a copy on this computer, which need no node.
@@ -102,12 +103,33 @@ pub fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Res
     let (dir, refname) = (Path::new(arg(0, "DIR")?), arg(1, "REF")?);
     match command {
         "log" => {
-            let count = match rest.get(2) {
-                Some(n) => n.parse().map_err(|_| Error::InvalidInput(format!("{n:?} is not a count")))?,
-                None => 20,
+            let number = |n: usize, default: usize| match rest.get(n) {
+                Some(n) => n.parse().map_err(|_| Error::InvalidInput(format!("{n:?} is not a count"))),
+                None => Ok(default),
             };
-            for commit in crate::local::log(dir, refname, count)? {
+            let (commits, _) = crate::local::log_page(dir, refname, number(3, 0)?, number(2, 20)?)?;
+            for commit in commits {
                 say(out, format!("{} {} {} {}", commit.id, iso8601(commit.time.max(0) as u64), commit.author, commit.subject))?;
+            }
+        }
+        "commit" => {
+            let commit = crate::local::commit(dir, refname)?;
+            say(out, format!("commit {}", commit.info.id))?;
+            for parent in &commit.parents {
+                say(out, format!("parent {parent}"))?;
+            }
+            say(out, format!("author {} <{}> {}", commit.info.author, commit.email, iso8601(commit.info.time.max(0) as u64)))?;
+            say(out, format!("\n{}\n", commit.message.trim_end()))?;
+            for change in &commit.changes {
+                let mark = match change.kind {
+                    crate::local::ChangeKind::Added => 'A',
+                    crate::local::ChangeKind::Deleted => 'D',
+                    crate::local::ChangeKind::Modified => 'M',
+                };
+                say(out, format!("{mark} {}", change.path))?;
+            }
+            if commit.more_changes {
+                say(out, "and more")?;
             }
         }
         "tree" => {
