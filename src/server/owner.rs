@@ -96,6 +96,32 @@ impl Node {
         out
     }
 
+    /// The repositories `peer` may read, by group and folder name: what a
+    /// listing of the node shows them. A blocked peer may read none.
+    pub fn readable_by(&self, peer: &[u8; 16]) -> Vec<(String, String)> {
+        if self.blocked.contains(peer) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for group in self.groups() {
+            let Ok(entries) = std::fs::read_dir(self.root.join(&group)) else { continue };
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| plain_repo(&group, name) && self.allowed(&group, name, peer, Perm::Read))
+                .collect();
+            names.sort();
+            for name in names {
+                if out.len() >= MAX_LISTED {
+                    return out;
+                }
+                out.push((group.clone(), name));
+            }
+        }
+        out
+    }
+
     /// Make a group, if there isn't one.
     pub fn make_group(&self, group: &str) -> Result<(), String> {
         if !plain_group(group) {

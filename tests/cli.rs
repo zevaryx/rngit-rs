@@ -281,6 +281,12 @@ async fn a_copy_is_read_with_log_tree_and_show() {
     result.unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert!(lines.len() == 2 && lines[0].ends_with(" binary") && lines[1].ends_with(" commit 1"), "{text}");
+    let (result, text) = cli(&client, &["log", dir, "refs/heads/main", "5", "2"], "").await;
+    result.unwrap();
+    assert!(text.lines().count() == 1 && text.ends_with(" commit 0\n"), "{text}");
+    let (result, text) = cli(&client, &["commit", dir, "refs/heads/main"], "").await;
+    result.unwrap();
+    assert!(text.starts_with("commit ") && text.contains("parent ") && text.contains("\nbinary\n") && text.ends_with("A bin\n"), "{text}");
     let (result, text) = cli(&client, &["tree", dir, "refs/heads/main"], "").await;
     result.unwrap();
     assert!(text.contains("file0.txt  ") && text.contains("bin  3"), "{text}");
@@ -290,7 +296,13 @@ async fn a_copy_is_read_with_log_tree_and_show() {
     let (result, text) = cli(&client, &["show", dir, "refs/heads/main", "bin"], "").await;
     result.unwrap();
     assert_eq!(text, "binary file, 3 bytes\n");
-    for args in [&["log", dir][..], &["log", dir, "refs/heads/main", "many"], &["show", dir, "refs/heads/main"], &["tree", dir, "main"]] {
+    for args in [
+        &["log", dir][..],
+        &["log", dir, "refs/heads/main", "many"],
+        &["show", dir, "refs/heads/main"],
+        &["tree", dir, "main"],
+        &["commit", dir, "main"],
+    ] {
         let (result, _) = cli(&client, args, "").await;
         assert!(matches!(result, Err(Error::InvalidInput(_))), "{args:?}");
     }

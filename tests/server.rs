@@ -1204,6 +1204,13 @@ async fn the_owner_manages_what_the_node_hosts_whatever_the_rules() {
     node.set_rules("team", None, "r:all").unwrap();
     let open: Vec<_> = node.hosted().iter().map(|h| h.open).collect();
     assert_eq!(open, [false, true]);
+    // What each may read, as a listing shows them; a blocked peer, nothing.
+    let pair = |g: &str, r: &str| (g.to_string(), r.to_string());
+    assert_eq!(node.readable_by(&rngit::server::NULL_IDENT), [pair("team", "empty.git")]);
+    assert_eq!(node.readable_by(&ME), [pair("mirrors", "demo.git"), pair("team", "empty.git")]);
+    node.blocked.insert(ME);
+    assert!(node.readable_by(&ME).is_empty());
+    node.blocked.clear();
 
     // Syncing follows the source; a repository that follows nothing can't.
     git(&source_repo, &["branch", "later", "main"]);

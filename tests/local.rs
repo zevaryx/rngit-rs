@@ -132,3 +132,76 @@ fn the_refs_of_a_copy_are_listed_with_its_head() {
     assert_eq!(refs.head.as_deref(), Some("refs/heads/main"));
     assert!(local::refs(&copy.join("nowhere")).is_err());
 }
+
+#[test]
+fn the_log_pages_and_says_whether_there_is_more() {
+    let (_tmp, copy) = copy();
+    let (first, more) = local::log_page(&copy, "refs/heads/topic", 0, 2).unwrap();
+    assert_eq!((first.len(), more), (2, true));
+    let (rest, more) = local::log_page(&copy, "refs/heads/topic", 2, 2).unwrap();
+    assert_eq!(rest.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), ["commit 0"]);
+    assert!(!more);
+    // From a commit's hash too.
+    let hash = git(&copy, &["rev-parse", "main"]);
+    assert_eq!(local::log_page(&copy, &hash, 0, 5).unwrap().0[0].subject, "second commit");
+    assert!(matches!(local::log_page(&copy, &"0".repeat(40), 0, 5), Err(Error::Git(_))));
+}
+
+#[test]
+fn a_commit_says_what_it_changed() {
+    let (_tmp, copy) = copy();
+    let main = git(&copy, &["rev-parse", "main"]);
+    let detail = local::commit(&copy, &main).unwrap();
+    assert_eq!(detail.info.subject, "second commit");
+    assert_eq!(detail.message.trim_end(), "second commit\n\nwith a body");
+    assert_eq!(detail.parents.len(), 1);
+    assert!(!detail.email.is_empty() && !detail.more_changes);
+    let changed: Vec<(&str, local::ChangeKind)> = detail.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    for path in ["README.md", "blob.bin", "long.txt", "src/deep/x.txt", "src/main.rs"] {
+        assert!(changed.contains(&(path, local::ChangeKind::Added)), "{changed:?}");
+    }
+    let topic = local::commit(&copy, "refs/heads/topic").unwrap();
+    assert_eq!(topic.changes, [local::Change { path: "topic.txt".into(), kind: local::ChangeKind::Added }]);
+    // The first commit adds all it has.
+    let first = git(&copy, &["rev-list", "--max-parents=0", "main"]);
+    let root = local::commit(&copy, &first).unwrap();
+    assert!(root.parents.is_empty() && !root.changes.is_empty());
+}
+
+#[test]
+fn changes_and_removals_are_told_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (work, copy) = (tmp.path().join("work"), tmp.path().join("copy.git"));
+    work_repo(&work, 1);
+    std::fs::create_dir_all(work.join("dir")).unwrap();
+    std::fs::write(work.join("dir/a.txt"), "a").unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "add"]);
+    std::fs::write(work.join("file0.txt"), "changed").unwrap();
+    std::fs::remove_dir_all(work.join("dir")).unwrap();
+    // A file where a folder was.
+    std::fs::write(work.join("dir"), "now a file").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "change"]);
+    bare_repo(&copy);
+    git(&work, &["push", "-q", copy.to_str().unwrap(), "main"]);
+    let detail = local::commit(&copy, "refs/heads/main").unwrap();
+    let changed: Vec<(&str, local::ChangeKind)> = detail.changes.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    use local::ChangeKind::*;
+    assert_eq!(changed, [("dir/a.txt", Deleted), ("dir", Added), ("file0.txt", Modified)]);
+}
+
+#[test]
+fn what_a_path_is_and_whole_files_up_to_a_size() {
+    let (_tmp, copy) = copy();
+    assert_eq!(local::kind(&copy, "refs/heads/main", "").unwrap(), None);
+    assert_eq!(local::kind(&copy, "refs/heads/main", "src").unwrap(), Some(EntryKind::Dir));
+    assert_eq!(local::kind(&copy, "refs/heads/main", "src/main.rs").unwrap(), Some(EntryKind::File));
+    assert!(local::kind(&copy, "refs/heads/main", "../x").is_err());
+    assert_eq!(local::read(&copy, "refs/heads/main", "blob.bin", 5).unwrap(), [0u8, 1, 2, 255, 254]);
+    assert!(matches!(local::read(&copy, "refs/heads/main", "blob.bin", 4), Err(Error::TooLarge { size: 5, .. })));
+    assert!(matches!(local::read(&copy, "refs/heads/main", "src", 100), Err(Error::InvalidInput(_))));
+    assert!(matches!(local::read(&copy, "refs/heads/main", "", 100), Err(Error::InvalidInput(_))));
+    let hash = git(&copy, &["rev-parse", "topic"]);
+    assert_eq!(local::read(&copy, &hash, "topic.txt", 10).unwrap(), b"t");
+}
